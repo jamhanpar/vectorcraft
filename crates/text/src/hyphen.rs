@@ -1,13 +1,22 @@
 //! Pattern-free English hyphenation: break long words between syllables at vowel–consonant
-//! boundaries (V-CV: "ty-po", and VC-CV: "hap-pen"), never leaving fewer than [`MIN_BEFORE`]
-//! letters before or [`MIN_AFTER`] after the hyphen.
+//! boundaries (V-CV: "ty-po", and VC-CV: "hap-pen"). A paragraph's Hyphenation options
+//! ([`HyphenationOptions`]) set the shortest word that breaks, the fewest letters left before and
+//! after the hyphen ([`MIN_BEFORE`] and [`MIN_AFTER`] by default), and whether capitalized words
+//! break.
 //!
 //! Preferences › Hyphenation › Exceptions (comma separated) override the points for named words:
 //! `typography` never breaks, `ty-pog-ra-phy` breaks only where the hyphens mark. See
 //! [`set_hyphenation_exceptions`].
+//!
+//! Each run hyphenates in its own language ([`vectorcraft_doc::CharStyle::language`]). English is
+//! the only language with break points so far: text in any other language, or in a language a
+//! file names that isn't known, doesn't hyphenate, apart from the words in the Exceptions list
+//! ([`language_has_patterns`]).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+
+use vectorcraft_doc::HyphenationOptions;
 
 /// Only words at least this long are hyphenated (Illustrator's default: longer than 5 letters).
 pub const MIN_WORD: usize = 6;
@@ -86,6 +95,26 @@ fn parse_exception(entry: &str) -> (String, Exception) {
     (word, Exception::Only(points))
 }
 
+/// Exception points count chars of the lowercased word; lowercasing can add chars ('İ' becomes
+/// 'i' + U+0307), so map each point back to the char index in `word` it falls before. Points
+/// inside one char's lowercase expansion are dropped; a point at the end of the word is kept.
+fn lowercase_points_to_word(word: &str, pts: &[usize]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(pts.len());
+    let mut lower = 0;
+    let mut len = 0;
+    for (i, ch) in word.chars().enumerate() {
+        if pts.contains(&lower) {
+            out.push(i);
+        }
+        lower += ch.to_lowercase().count();
+        len = i + 1;
+    }
+    if pts.contains(&lower) {
+        out.push(len);
+    }
+    out
+}
+
 fn normalize_word(word: &str) -> String {
     word.chars().flat_map(|c| c.to_lowercase()).collect()
 }
@@ -120,28 +149,58 @@ fn onset_pair(a: char, b: char) -> bool {
     )
 }
 
-/// Allowed hyphenation points in `word`, as char indices (a hyphen goes *before* the char).
-/// Words containing non-letters (other than a trailing apostrophe) are not hyphenated.
-/// Preferences exceptions override the pattern for a matching word.
+/// Whether text in `language` (a [`vectorcraft_doc::CharStyle::language`]: a BCP 47 tag, `None` for
+/// the default, English: USA) has break points of its own.
+pub fn language_has_patterns(language: Option<&str>) -> bool {
+    language.is_none_or(|l| l.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("en")) && matches!(l.as_bytes().get(2), None | Some(b'-')))
+}
+
+/// Allowed hyphenation points in `word`, as char indices (a hyphen goes *before* the char), with
+/// the default Hyphenation options.
 pub fn hyphen_points(word: &str) -> Vec<usize> {
+    hyphen_points_with(word, &HyphenationOptions::default())
+}
+
+/// Allowed hyphenation points in `word`, as char indices (a hyphen goes *before* the char), within
+/// a paragraph's Hyphenation options: words with more letters than Words Longer Than, at least
+/// After First letters before the hyphen and Before Last after it (at least 1 each), and no word
+/// that starts with a capital when Hyphenate Capitalized Words is off. Words containing non-letters
+/// (other than a trailing apostrophe) are not hyphenated. Preferences exceptions override the
+/// pattern and these options for a matching word.
+pub fn hyphen_points_with(word: &str, opts: &HyphenationOptions) -> Vec<usize> {
+    hyphen_points_in(word, opts, true)
+}
+
+/// [`hyphen_points_with`] for a word in a language with or without break points of its own
+/// ([`language_has_patterns`]): without them, only a word in the Exceptions list breaks.
+pub fn hyphen_points_in(word: &str, opts: &HyphenationOptions, patterns: bool) -> Vec<usize> {
     if let Some(ex) = exception_for(word) {
         return match ex {
             Exception::Never => vec![],
-            Exception::Only(pts) => pts,
+            Exception::Only(pts) => lowercase_points_to_word(word, &pts),
         };
+    }
+    if !patterns {
+        return vec![];
     }
     let c: Vec<char> = word.chars().collect();
     let n = c.len();
-    if n < MIN_WORD || !c.iter().all(|c| c.is_alphabetic() || matches!(c, '\'' | '’')) {
+    let longer_than = usize::try_from(opts.words_longer_than).unwrap_or(usize::MAX);
+    if n <= longer_than || !c.iter().all(|c| c.is_alphabetic() || matches!(c, '\'' | '’')) {
         return vec![];
     }
     // A capitalised run like "NASA" or a proper name stays whole only when all caps.
     if c.iter().all(|c| c.is_uppercase()) {
         return vec![];
     }
+    if !opts.capitalized && c.first().is_some_and(|c| c.is_uppercase()) {
+        return vec![];
+    }
+    let before = usize::try_from(opts.after_first).unwrap_or(usize::MAX).max(1);
+    let after = usize::try_from(opts.before_last).unwrap_or(usize::MAX).max(1);
     let v: Vec<bool> = c.iter().map(|&x| is_vowel(x)).collect();
     let mut out = vec![];
-    for i in MIN_BEFORE..=n.saturating_sub(MIN_AFTER) {
+    for i in before..=n.saturating_sub(after) {
         if !c[i].is_alphabetic() || !c[i - 1].is_alphabetic() {
             continue;
         }
@@ -196,6 +255,31 @@ mod tests {
         with_hyphenation_exceptions_for_test(source, f);
     }
 
+    /// #394: English in any region has break points; other languages, and a tag from a file that
+    /// isn't a known language, have none.
+    #[test]
+    fn only_english_has_break_points() {
+        for l in [None, Some("en-US"), Some("en-GB"), Some("EN-gb"), Some("en")] {
+            assert!(language_has_patterns(l), "{l:?}");
+        }
+        for l in [Some("de"), Some("fr"), Some("pt"), Some("eng"), Some("x-unknown"), Some(""), Some("é")] {
+            assert!(!language_has_patterns(l), "{l:?}");
+        }
+    }
+
+    /// #394: a language without break points leaves words whole, but the Exceptions list is the
+    /// user's own and applies in every language.
+    #[test]
+    fn a_language_without_break_points_keeps_only_the_exceptions() {
+        let opts = HyphenationOptions::default();
+        assert_eq!(hyphen_points_in("typography", &opts, true), vec![4, 7]);
+        assert!(hyphen_points_in("typography", &opts, false).is_empty());
+        with_exceptions("ty-pog-ra-phy, happen", || {
+            assert_eq!(hyphen_points_in("typography", &opts, false), vec![2, 5, 7]);
+            assert!(hyphen_points_in("happen", &opts, false).is_empty());
+        });
+    }
+
     /// #394 Preferences › Hyphenation › Exceptions contract (parse + override).
     #[test]
     fn hyphenation_exceptions_override_the_pattern() {
@@ -222,6 +306,54 @@ mod tests {
         });
 
         assert_eq!(hyphen_points("typography"), pattern, "override cleared");
+    }
+
+    /// Exception break points are char indices into the word itself, even when lowercasing
+    /// changes the char count ('İ' lowercases to 'i' + U+0307).
+    #[test]
+    fn exception_points_index_the_original_word() {
+        with_exceptions("İs-tan-bul", || {
+            assert_eq!(hyphen_points("İstanbul"), vec![2, 5]);
+            assert_eq!(hyphenate_word("İstanbul"), "İs-tan-bul");
+            assert_eq!(hyphenate_word("İSTANBUL"), "İS-TAN-BUL");
+        });
+    }
+
+    /// The default Hyphenation options are the limits of [`hyphen_points`]: words of 6 letters or
+    /// more, 3 letters on each side of the hyphen.
+    #[test]
+    fn default_hyphenation_options_keep_the_default_limits() {
+        let d = HyphenationOptions::default();
+        assert_eq!((d.words_longer_than as usize + 1, d.after_first as usize, d.before_last as usize), (MIN_WORD, MIN_BEFORE, MIN_AFTER));
+        for w in ["typography", "happen", "hyphenation", "language", "aromatic", "Language", "short"] {
+            assert_eq!(hyphen_points_with(w, &d), hyphen_points(w), "{w}");
+        }
+    }
+
+    /// Paragraph panel menu › Hyphenation…: Words Longer Than, After First, Before Last and
+    /// Hyphenate Capitalized Words limit where a word breaks.
+    #[test]
+    fn hyphenation_options_limit_the_points() {
+        let opts = |f: &dyn Fn(&mut HyphenationOptions)| {
+            let mut o = HyphenationOptions::default();
+            f(&mut o);
+            o
+        };
+        // An 8-letter word breaks by default, and not when only longer words may.
+        assert_eq!(hyphen_points("language"), vec![3]);
+        assert!(hyphen_points_with("language", &opts(&|o| o.words_longer_than = 10)).is_empty());
+        assert!(hyphen_points_with("language", &opts(&|o| o.words_longer_than = 8)).is_empty());
+        assert_eq!(hyphen_points_with("language", &opts(&|o| o.words_longer_than = 7)), vec![3]);
+        // After First and Before Last: "aro-ma-tic" by default, nothing with 4 and 4, "a-ro-ma-tic" with 1 and 1.
+        assert_eq!(hyphen_points("aromatic"), vec![3, 5]);
+        assert!(hyphen_points_with("aromatic", &opts(&|o| (o.after_first, o.before_last) = (4, 4))).is_empty());
+        assert_eq!(hyphen_points_with("aromatic", &opts(&|o| (o.after_first, o.before_last) = (1, 1))), vec![1, 3, 5]);
+        // 0 letters on either side still leaves the hyphen inside the word.
+        assert_eq!(hyphen_points_with("aromatic", &opts(&|o| (o.after_first, o.before_last) = (0, 0))), vec![1, 3, 5]);
+        // Capitalized words.
+        assert_eq!(hyphen_points("Language"), vec![3]);
+        assert!(hyphen_points_with("Language", &opts(&|o| o.capitalized = false)).is_empty());
+        assert_eq!(hyphen_points_with("language", &opts(&|o| o.capitalized = false)), vec![3]);
     }
 
     /// Process-wide store used by `prefs.set` / restore.
