@@ -2,6 +2,7 @@
 
 pub mod actionset;
 mod addons;
+mod apiref;
 pub(crate) mod appearance;
 mod assets;
 mod attributes;
@@ -69,6 +70,7 @@ pub mod pdfcmds;
 pub mod perspgrid;
 pub mod place;
 pub mod plugin;
+pub(crate) mod plugin_call;
 pub mod prefscmds;
 pub mod print;
 pub(crate) mod printadvanced;
@@ -384,6 +386,8 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(actionset::specs());
         v.extend(importmatches::specs());
         v.extend(addons::specs());
+        // Last, so the reference it writes ends with its own section.
+        v.extend(apiref::specs());
         v
     })
 }
