@@ -239,6 +239,9 @@ struct Body {
 fn body(doc: &Document, o: &SaveOptions) -> Result<Body, FormatError> {
     let version = o.version;
     let mut d = doc.without_edit_modes().into_owned();
+    // Ruler guides are saved in the document's `guides` list, as before they were nodes, so every
+    // version reads them.
+    d.guides_to_saved();
     // Older apps don't know placed documents: they get the art the objects show, with its
     // resources. Otherwise resources only exporting adds are never saved.
     if version < VERSION && d.has_placed() {
@@ -511,6 +514,8 @@ fn load_file_within(bytes: &[u8], max_nodes: usize, max_values: usize) -> Result
     // fields read before an object's type at `MAX_BUFFERED_VALUES` values. The preview and the
     // PDF are skipped without being kept.
     fn within_budgets<T>(max_nodes: usize, max_values: usize, read: impl FnOnce() -> T) -> T {
+        #[cfg(test)]
+        DOCUMENT_READS.with(|n| n.set(n.get() + 1));
         vectorcraft_doc::geom::path::with_anchor_budget(vectorcraft_doc::geom::path::MAX_READ_ANCHORS, || {
             vectorcraft_doc::node::with_node_budget(max_nodes, || vectorcraft_doc::node::with_buffered_value_budget(max_values, read))
         })
@@ -527,9 +532,10 @@ fn load_file_within(bytes: &[u8], max_nodes: usize, max_values: usize) -> Result
     let (mut f, pdf_compatible) = match within_budgets(max_nodes, max_values, || Contents::<Document>::read_with_pdf_preference(file.json())) {
         Ok(read) => read,
         // That pass refuses a `pdfCompatible` that is not a boolean, and any other data error.
-        // The file is read again without the preference, and only then is its JSON scanned for
-        // the preference a second time, so such a file opens as before.
-        Err(ReadError::Json(e)) if e.is_data() => {
+        // When it stopped at the preference, the file is read again without it, and only then is
+        // its JSON scanned for the preference a second time, so such a file opens as before. Any
+        // other error, such as a document past a budget, is returned without a second read.
+        Err(ReadError::Json(e)) if e.is_data() && refused_preference_at(file.json(), &e) => {
             let f = within_budgets(max_nodes, max_values, || Contents::<Document>::read(file.json())).map_err(read_error)?;
             let pdf_compatible = pdf_member(file.json()).map_err(|e| FormatError::NotVectorcraft(e.to_string()))?;
             (f, pdf_compatible)
@@ -588,6 +594,10 @@ fn load_file_within(bytes: &[u8], max_nodes: usize, max_values: usize) -> Result
     doc.raster_effects.add_around = doc.raster_effects.add_around.clamp(0.0, vectorcraft_doc::rastersettings::MAX_ADD_AROUND);
     let mut depth_notes = vec![];
     doc.limit_depth_noting(&mut depth_notes);
+    // Untrusted: ruler guide nodes only directly in layers, above their art (after the depth limit:
+    // the walk recurses; before the canvas check, which takes a layer's first member as its
+    // clipping path).
+    doc.tidy_ruler_guides();
     // Untrusted: nothing beyond the canvas, where no edit may leave anything (after the depth
     // limit: the walk recurses). A file whose artboards all lie there has no page to show (#3575).
     let had_artboards = !doc.artboards.is_empty();
@@ -599,6 +609,9 @@ fn load_file_within(bytes: &[u8], max_nodes: usize, max_values: usize) -> Result
         )));
     }
     depth_notes.extend(beyond.note());
+    // The saved ruler guides become nodes on their layers (after the guides beyond the canvas are
+    // dropped, and after `fix_next_id`: new ids start above the file's).
+    doc.guides_into_nodes();
     // Untrusted: the type's sizes, leading, baseline shifts and scales, its indents and paragraph
     // spacing, and its tab stops, each within its range (after the depth limit: the walk recurses).
     doc.keep_type_values_in_range();
@@ -631,6 +644,51 @@ fn load_file_within(bytes: &[u8], max_nodes: usize, max_values: usize) -> Result
 thread_local! {
     /// Tests: how many times a file's JSON was scanned again for its PDF preference on this thread.
     static PDF_MEMBER_SCANS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Tests: how many times a file's document was read on this thread.
+    static DOCUMENT_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether reading `json`'s `pdfCompatible` as a boolean or null fails with a data error at the
+/// line and column of `e`, that is, whether the read that gave `e` stopped at the preference. Only
+/// the bytes up to that position, and the one there, are read, and they are skipped without being
+/// kept.
+fn refused_preference_at(json: &[u8], e: &serde_json::Error) -> bool {
+    // serde_json gives a 1-based line and the bytes before the position on that line.
+    let Some(line_start) = (match e.line() {
+        0 => None,
+        1 => Some(0),
+        n => json.iter().enumerate().filter(|(_, b)| **b == b'\n').nth(n - 2).map(|(i, _)| i + 1),
+    }) else {
+        return false;
+    };
+    let end = line_start.saturating_add(e.column()).saturating_add(1).min(json.len());
+    struct StrictPreference;
+    impl<'de> Visitor<'de> for StrictPreference {
+        type Value = ();
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a native file envelope")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "pdfCompatible" {
+                    map.next_value::<Option<bool>>()?;
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(())
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(())
+        }
+    }
+    serde_json::Deserializer::from_slice(&json[..end])
+        .deserialize_any(StrictPreference)
+        .is_err_and(|s| s.is_data() && s.line() == e.line() && s.column() == e.column())
 }
 
 /// The saved PDF preference, falling back to the presence of its payload without retaining or
@@ -842,9 +900,44 @@ mod tests {
             value["pdfCompatible"] = odd.clone();
             assert_eq!(scans_for(&serde_json::to_vec(&value).unwrap()), (false, 1), "{odd}");
         }
-        // A document that can't be read still fails, after the second read.
+        // A document that can't be read still fails. Read before the preference, it is not read
+        // a second time.
         value["document"] = serde_json::json!("not a document");
+        DOCUMENT_READS.with(|n| n.set(0));
         assert!(load_info(&serde_json::to_vec(&value).unwrap()).is_err());
+        assert_eq!(DOCUMENT_READS.with(|n| n.get()), 1);
+        // Read after a preference that is not a boolean, it fails on the second read, which is
+        // the first to reach it.
+        let mut first = serde_json::to_vec(&value).unwrap();
+        assert!(first.starts_with(br#"{"document""#));
+        first.splice(1..1, br#""pdfCompatible":"yes","#.iter().copied());
+        DOCUMENT_READS.with(|n| n.set(0));
+        assert!(load_info(&first).is_err());
+        assert_eq!(DOCUMENT_READS.with(|n| n.get()), 2);
+    }
+
+    /// A document past a read budget is refused after one read, also in a file whose preference
+    /// is not a boolean.
+    #[test]
+    fn a_document_past_a_budget_is_read_once() {
+        let mut d = Document::new(100.0, 100.0);
+        let l = d.add_layer(None);
+        for i in 0..20 {
+            let id = d.alloc_id();
+            d.insert(Some(l), i, Node::path(id, shapes::ellipse(Rect::new(0.0, 0.0, 10.0, 10.0)), Appearance::default_art())).unwrap();
+        }
+        let n = d.node_count();
+        let mut value: serde_json::Value = serde_json::from_slice(&save(&d, false)).unwrap();
+        for preference in [serde_json::Value::Null, serde_json::json!(true), serde_json::json!("yes")] {
+            value["pdfCompatible"] = preference.clone();
+            let bytes = serde_json::to_vec(&value).unwrap();
+            DOCUMENT_READS.with(|r| r.set(0));
+            let Err(FormatError::NotVectorcraft(why)) = load_file_within(&bytes, n - 1, vectorcraft_doc::node::MAX_BUFFERED_VALUES) else {
+                panic!("one object past the budget must be refused")
+            };
+            assert!(why.contains(&format!("more than {} objects", n - 1)), "{why}");
+            assert_eq!(DOCUMENT_READS.with(|r| r.get()), 1, "{preference}");
+        }
     }
 
     #[test]
@@ -1120,6 +1213,66 @@ mod tests {
         assert_eq!(load(&bytes).unwrap().node_count(), n, "the real budget opens ordinary documents");
     }
 
+    /// The saved ruler guides become objects when read, so each counts against the same budget.
+    #[test]
+    fn saved_ruler_guides_count_against_the_object_budget() {
+        let mut d = Document::new(100.0, 100.0);
+        let l = d.add_layer(None);
+        let id = d.alloc_id();
+        d.insert(Some(l), 0, Node::path(id, shapes::ellipse(Rect::new(0.0, 0.0, 10.0, 10.0)), Appearance::default_art())).unwrap();
+        for i in 0..50 {
+            d.add_ruler_guide(&vectorcraft_doc::Guide::new(i % 2 == 0, f64::from(i)));
+        }
+        let n = d.node_count() + d.ruler_guides().len();
+        let bytes = save_with(&d, &SaveOptions { compress: true, ..SaveOptions::default() }).unwrap();
+        let opened = load_file_within(&bytes, n, vectorcraft_doc::node::MAX_BUFFERED_VALUES).unwrap().doc;
+        assert_eq!(opened.ruler_guides().len(), 50, "a document of exactly the budget opens with its guides");
+        let Err(FormatError::NotVectorcraft(why)) = load_file_within(&bytes, n - 1, vectorcraft_doc::node::MAX_BUFFERED_VALUES) else {
+            panic!("one guide past the budget must be refused")
+        };
+        assert!(why.contains(&format!("more than {} objects", n - 1)), "{why}");
+    }
+
+    /// Ruler guide nodes a file holds out of place are put right as it is read: one below a layer's
+    /// art moves up to the layer's guides, and one in a group, beside the layers or in a symbol is
+    /// removed. Saving again writes no ruler guide node, which builds from before ruler guides
+    /// were nodes could not read.
+    #[test]
+    fn ruler_guide_nodes_out_of_place_in_a_file_are_put_right() {
+        let mut d = Document::new(100.0, 100.0);
+        let l = d.add_layer(None);
+        let (a, b, group) = (d.alloc_id(), d.alloc_id(), d.alloc_id());
+        let path = |id| Node::path(id, shapes::ellipse(Rect::new(0.0, 0.0, 10.0, 10.0)), Appearance::default_art());
+        d.insert(Some(l), 0, path(a)).unwrap();
+        d.insert(Some(l), usize::MAX, Node::group(group, vec![Arc::new(path(b))])).unwrap();
+        let li = d.layers.iter().position(|x| x.id == l).unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&save(&d, false)).unwrap();
+        let guide = |id: u64| serde_json::json!({"id": id, "kind": {"type": "rulerguide", "vertical": true, "pos": 5.0}});
+        let kids = &mut v["document"]["layers"][li]["kind"]["children"];
+        kids.as_array_mut().unwrap().insert(0, guide(50));
+        kids[2]["kind"]["children"].as_array_mut().unwrap().push(guide(51));
+        v["document"]["layers"].as_array_mut().unwrap().push(guide(52));
+        let opened = load(&serde_json::to_vec(&v).unwrap()).unwrap();
+        let listed: Vec<u64> = opened.ruler_guides().iter().filter_map(|g| g.id).map(|id| id.0).collect();
+        assert_eq!(listed, [50]);
+        let layer = opened.layers.iter().find(|x| x.id == l).unwrap();
+        assert_eq!(layer.children().unwrap().iter().map(|c| c.id.0).collect::<Vec<_>>(), [a.0, group.0, 50], "art first, then the guide");
+        assert_eq!(opened.node(group).unwrap().children().unwrap().len(), 1, "the group keeps only its path");
+        assert!(opened.layers.iter().all(|x| !x.is_ruler_guide()));
+        assert!(!String::from_utf8(save(&opened, false)).unwrap().contains("rulerguide"));
+
+        // A ruler guide in a symbol's art is removed too.
+        let mut d = Document::new(100.0, 100.0);
+        let sym = d.alloc_id();
+        let art = Node::group(sym, vec![Arc::new(path(d.alloc_id()))]);
+        d.symbols.push(vectorcraft_doc::Symbol { name: "S".into(), art: Arc::new(art), dynamic: false });
+        let mut v: serde_json::Value = serde_json::from_slice(&save(&d, false)).unwrap();
+        v["document"]["symbols"][0]["art"]["kind"]["children"].as_array_mut().unwrap().push(guide(60));
+        let opened = load(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!(opened.symbols[0].art.children().unwrap().len(), 1);
+        assert!(!opened.symbols[0].art.children().unwrap().iter().any(|c| c.is_ruler_guide()));
+    }
+
     /// #3587: a reordered file (its objects' fields before their `type`, as a JSON tool that
     /// sorts keys writes them) still opens; one whose fields before a `type` hold more values than
     /// the budget, such as a long array of numbers, is refused as they are read.
@@ -1232,5 +1385,36 @@ mod tests {
         assert_eq!(base64_decode("QQ=="), Some(vec![0x41]));
         assert_eq!(base64_decode("QUI="), Some(vec![0x41, 0x42]));
         assert_eq!(base64_decode("QUJD"), Some(vec![0x41, 0x42, 0x43]));
+    }
+
+    /// A layer clipping by a path beyond the canvas is emptied on open and stops clipping, also
+    /// when the file puts a ruler guide before the clipping path: no other object becomes it.
+    #[test]
+    fn a_guide_before_a_clipping_path_beyond_the_canvas_does_not_change_the_clipping_path() {
+        let opened = |guide_first: bool| {
+            let mut d = Document::new(100.0, 100.0);
+            let rect = |d: &mut Document, y: f64| {
+                Arc::new(Node::path(d.alloc_id(), shapes::rectangle(Rect::new(0.0, y, 10.0, y + 10.0)), Appearance::default_art()))
+            };
+            let (far, near) = (rect(&mut d, 1e17), rect(&mut d, 0.0));
+            if let NodeKind::Layer { children, clip, .. } = &mut Arc::make_mut(&mut d.layers[0]).kind {
+                *children = vec![far, near];
+                *clip = true;
+            }
+            // Saving writes ruler guides to the saved list: the guide node is put in the file.
+            let mut v: serde_json::Value = serde_json::from_slice(&save(&d, false)).unwrap();
+            let guide = serde_json::json!({"id": 50, "kind": {"type": "rulerguide", "vertical": true, "pos": 5.0}});
+            let kids = v["document"]["layers"][0]["kind"]["children"].as_array_mut().unwrap();
+            if guide_first {
+                kids.insert(0, guide)
+            } else {
+                kids.push(guide)
+            }
+            let d = load(&serde_json::to_vec(&v).unwrap()).unwrap();
+            let NodeKind::Layer { children, clip, .. } = &d.layers[0].kind else { panic!("a layer") };
+            (*clip, children.iter().map(|c| c.is_ruler_guide()).collect::<Vec<_>>())
+        };
+        assert_eq!(opened(false), (false, vec![true]), "the clipping path and what it clipped go; the guide stays");
+        assert_eq!(opened(true), opened(false));
     }
 }

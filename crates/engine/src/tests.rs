@@ -47,6 +47,7 @@ mod docsetup;
 mod document_move;
 mod draw2;
 mod dynamic_symbols;
+mod dynamic_text;
 mod editcolors;
 mod effectedit;
 mod emptytype;
@@ -88,6 +89,7 @@ mod layerclip;
 mod layers;
 mod legacy_ai;
 mod library;
+mod library_roots;
 mod link_paths;
 mod linked_stops;
 mod linkfiles;
@@ -151,8 +153,15 @@ mod save;
 mod saveoptions;
 mod scalestrokes;
 mod script_console;
+mod script_dialogs;
+mod script_dollar;
+mod script_engines;
+mod script_folder;
+mod script_include;
+mod script_io;
 mod script_run;
 mod scripts;
+mod select_effects;
 mod select_ids_first;
 mod shaper;
 mod shapetools;
@@ -188,6 +197,7 @@ mod toolsettings;
 mod transformfx;
 mod transparencygrid;
 mod trap;
+mod turn_direction;
 mod typearea;
 mod typeglyphbounds;
 mod typescale;
@@ -209,6 +219,18 @@ fn session() -> Session {
 fn rect(s: &mut Session, x: f64, y: f64, w: f64, h: f64) -> NodeId {
     let r = s.execute("shape.rectangle", &json!({"x": x, "y": y, "width": w, "height": h})).unwrap();
     NodeId(r["id"].as_u64().unwrap())
+}
+
+/// The active document's selected ruler guides, by their `guide.list` indexes.
+pub(crate) fn selected_guides(s: &Session) -> Vec<usize> {
+    let st = s.doc().unwrap();
+    crate::cmd::guide_indexes(&st.doc, &st.selection.guides)
+}
+
+/// The active document's key guide, by its `guide.list` index.
+pub(crate) fn key_guide(s: &Session) -> Option<usize> {
+    let st = s.doc().unwrap();
+    st.selection.key_guide.and_then(|k| crate::cmd::guide_indexes(&st.doc, &[k]).first().copied())
 }
 
 #[test]
@@ -3141,7 +3163,7 @@ fn every_command_survives_empty_params() {
     // The view toggles among them flip the process-wide proof view.
     let _proof_view = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
     for sel in [false, true] {
-        for c in command_specs() {
+        for c in command_specs().iter().filter(|c| crate::runs_with_empty_params(c.id)) {
             let mut s = session();
             let a = rect(&mut s, 0.0, 0.0, 10.0, 10.0);
             rect(&mut s, 20.0, 0.0, 10.0, 10.0);
@@ -3217,9 +3239,8 @@ fn flare_rotation_turns_only_the_rays() {
 fn reshape_moves_the_grabbed_point_and_its_neighbourhood() {
     let mut s = session();
     let r = rect(&mut s, 0.0, 0.0, 100.0, 100.0);
-    // Grab the middle of the top edge: a new anchor appears there and moves the full delta. The
-    // radius, about half the square's diagonal, bounds the reach.
-    s.execute("path.reshape", &json!({"id": r.0, "x": 50.0, "y": 0.0, "dx": 0.0, "dy": -40.0, "radius": 70.0})).unwrap();
+    // Grab the middle of the top edge: a new anchor appears there and moves the full delta.
+    s.execute("path.reshape", &json!({"id": r.0, "x": 50.0, "y": 0.0, "dx": 0.0, "dy": -40.0})).unwrap();
     let st = s.doc().unwrap();
     let pd = st.doc.node(r).unwrap().path_data().unwrap().clone();
     assert_eq!(pd.anchor_count(), 5);
@@ -3478,7 +3499,7 @@ fn reshape_of_a_closed_path_selected_whole_moves_all_of_it() {
     let mut s = session();
     let r = rect(&mut s, 0.0, 0.0, 100.0, 100.0);
     let before = s.doc().unwrap().doc.node(r).unwrap().path_data().unwrap().clone();
-    s.execute("path.reshape", &json!({"id": r.0, "x": 0.0, "y": 0.0, "dx": 15.0, "dy": -40.0})).unwrap();
+    s.execute("path.reshape", &json!({"id": r.0, "x": 0.0, "y": 0.0, "dx": 15.0, "dy": -40.0, "focal": []})).unwrap();
     let after = s.doc().unwrap().doc.node(r).unwrap().path_data().unwrap().clone();
     assert_eq!(after.anchor_count(), before.anchor_count(), "a grab on an anchor adds none");
     let drag = vectorcraft_geom::Vec2::new(15.0, -40.0);
@@ -3492,7 +3513,7 @@ fn reshape_leaves_the_anchors_that_are_not_selected_in_place() {
     let mut s = session();
     let id = reshape_open_path(&mut s, reshape_line_of_seven());
     s.execute("select.anchors", &json!({"id": id.0, "anchors": [[0, 2], [0, 3], [0, 4], [0, 5]], "mode": "set"})).unwrap();
-    s.execute("path.reshape", &json!({"id": id.0, "x": 350.0, "y": 0.0, "dx": 0.0, "dy": 100.0})).unwrap();
+    s.execute("path.reshape", &json!({"id": id.0, "x": 350.0, "y": 0.0, "dx": 0.0, "dy": 100.0, "focal": []})).unwrap();
     let y: Vec<f64> = reshape_anchors(&s, id).iter().map(|a| a.p.y).collect();
     assert_eq!((y[0], y[1], y[5], y[6]), (0.0, 0.0, 100.0, 0.0), "{y:?}");
     // The stretch runs from the last anchor that is not selected, 280 from the focal point.
@@ -3500,6 +3521,29 @@ fn reshape_leaves_the_anchors_that_are_not_selected_in_place() {
         let u = (i as f64 - 1.0) / 4.0;
         assert!((y[i] - 100.0 * reshape_share(u)).abs() < 1e-9, "anchor {i} takes {u} of the way: {y:?}");
     }
+}
+
+/// A step with neither `focal` nor `radius`, as one recorded before focal points, plays as it did
+/// then: the selection does not matter, and a closed path follows with the default falloff.
+#[test]
+fn reshape_without_focal_or_radius_keeps_the_earlier_rule() {
+    let mut s = session();
+    let id = reshape_open_path(&mut s, reshape_line_of_seven());
+    s.execute("select.anchors", &json!({"id": id.0, "anchors": [[0, 2], [0, 3], [0, 4], [0, 5]], "mode": "set"})).unwrap();
+    s.execute("path.reshape", &json!({"id": id.0, "x": 350.0, "y": 0.0, "dx": 0.0, "dy": 100.0})).unwrap();
+    let y: Vec<f64> = reshape_anchors(&s, id).iter().map(|a| a.p.y).collect();
+    assert_eq!((y[0], y[5], y[6]), (0.0, 100.0, 0.0), "{y:?}");
+    // Anchor 1 is not selected and still takes its share, measured from the end 350 away.
+    for i in 1..5 {
+        let u = i as f64 / 5.0;
+        assert!((y[i] - 100.0 * reshape_share(u)).abs() < 1e-9, "anchor {i} takes {u} of the way: {y:?}");
+    }
+    // `focal: null` is the same as leaving it out.
+    let r = rect(&mut s, 0.0, 0.0, 100.0, 100.0);
+    s.execute("path.reshape", &json!({"id": r.0, "x": 0.0, "y": 0.0, "dx": 0.0, "dy": -40.0, "focal": null})).unwrap();
+    let pts: Vec<Point> = s.doc().unwrap().doc.node(r).unwrap().path_data().unwrap().anchors().map(|(_, _, a)| a.p).collect();
+    assert!(pts.contains(&Point::new(0.0, -40.0)), "{pts:?}");
+    assert!(pts.contains(&Point::new(100.0, 100.0)), "the far corner stays: {pts:?}");
 }
 
 #[test]
@@ -3516,7 +3560,7 @@ fn reshape_of_a_partly_selected_closed_path_stretches_between_the_anchors_that_s
     );
     // Anchors 5, 0, 1 and 2 are selected; 3 and 4 stay. The walk runs 4, 5, 0, 1, 2, 3.
     s.execute("select.anchors", &json!({"id": id.0, "anchors": [[0, 5], [0, 0], [0, 1], [0, 2]], "mode": "set"})).unwrap();
-    s.execute("path.reshape", &json!({"id": id.0, "x": 0.0, "y": 0.0, "dx": 0.0, "dy": -50.0})).unwrap();
+    s.execute("path.reshape", &json!({"id": id.0, "x": 0.0, "y": 0.0, "dx": 0.0, "dy": -50.0, "focal": []})).unwrap();
     let y: Vec<f64> = reshape_anchors(&s, id).iter().map(|a| a.p.y).collect();
     assert_eq!((y[0], y[3], y[4]), (-50.0, 100.0, 100.0), "{y:?}");
     // From anchor 4 to the focal point is 200: anchor 5 is halfway. From anchor 3 back to it is
@@ -3571,7 +3615,7 @@ fn reshape_of_a_segment_keeps_a_selected_segment_as_its_two_halves() {
 fn reshape_moves_only_the_subpaths_with_a_focal_point() {
     let mut s = session();
     let id = NodeId(s.execute("path.create", &json!({"d": "M0 0 L100 0 L200 0 M0 100 L100 100 L200 100"})).unwrap()["id"].as_u64().unwrap());
-    s.execute("path.reshape", &json!({"id": id.0, "x": 200.0, "y": 0.0, "dx": 0.0, "dy": 40.0})).unwrap();
+    s.execute("path.reshape", &json!({"id": id.0, "x": 200.0, "y": 0.0, "dx": 0.0, "dy": 40.0, "focal": []})).unwrap();
     let pd = s.doc().unwrap().doc.node(id).unwrap().path_data().unwrap().clone();
     let y: Vec<Vec<f64>> = pd.subpaths.iter().map(|sp| sp.anchors.iter().map(|a| a.p.y).collect()).collect();
     assert_eq!(y[1], vec![100.0, 100.0, 100.0], "{y:?}");
@@ -3598,9 +3642,12 @@ fn reshape_refuses_a_focal_point_that_is_not_an_anchor() {
     }
     assert_eq!(reshape_anchors(&s, id), before);
     let steps = s.doc().unwrap().history.undo.len();
-    let e =
-        s.execute("path.reshape", &json!({"id": id.0, "x": 420.0, "y": 0.0, "dx": 0.0, "dy": 10.0, "focal": [[0, 2]], "radius": 50.0})).unwrap_err();
-    assert!(e.to_string().contains("`focal` and `radius` cannot be used together"), "{e}");
+    // An empty `focal` chooses the focal-point rule too, so it cannot go with `radius` either.
+    for focal in [json!([[0, 2]]), json!([])] {
+        let e =
+            s.execute("path.reshape", &json!({"id": id.0, "x": 420.0, "y": 0.0, "dx": 0.0, "dy": 10.0, "focal": focal, "radius": 50.0})).unwrap_err();
+        assert!(e.to_string().contains("`focal` and `radius` cannot be used together"), "{focal}: {e}");
+    }
     assert_eq!(reshape_anchors(&s, id), before);
     assert_eq!(s.doc().unwrap().history.undo.len(), steps);
 }
@@ -4201,8 +4248,8 @@ fn given_targets_are_used_as_given_and_range_style_takes_the_selected_type() {
 
 /// #785: commands whose `ids` or `id` the shared check doesn't read (it reads `id` where it stands
 /// for `ids` of one) refuse one that isn't an object id. They don't act on the selection, the
-/// current layer or a new object instead, and the document, the selection and the undo history
-/// stay as they are.
+/// current layer or a new object instead, and the document, the selection, the undo history,
+/// isolation mode and the shown opacity mask stay as they are.
 #[test]
 fn malformed_ids_are_refused_by_commands_that_default_to_the_selection() {
     let mut s = session();
@@ -4250,17 +4297,19 @@ fn malformed_ids_are_refused_by_commands_that_default_to_the_selection() {
             if let Some(p) = p.as_object_mut() {
                 p.insert(key.into(), bad.clone());
             }
-            let (doc, selection, undo) = (s.doc().unwrap().doc.clone(), s.doc().unwrap().selection.clone(), s.doc().unwrap().history.undo.len());
+            let st = s.doc().unwrap();
+            let (doc, selection, undo, modes) = (st.doc.clone(), st.selection.clone(), st.history.undo.len(), (st.isolation, st.mask_view));
             let r = s.execute(cmd, &p);
             let named = |e: &str| e.contains("object id") || e.contains("step reference") || e.contains(&format!("`{key}` must be"));
             let refused = r.as_ref().err().map(|e| e.to_string()).is_some_and(|e| named(&e));
-            let same = s.doc().unwrap().doc == doc && s.doc().unwrap().selection == selection && s.doc().unwrap().history.undo.len() == undo;
+            let st = s.doc().unwrap();
+            let same = st.doc == doc && st.selection == selection && st.history.undo.len() == undo && (st.isolation, st.mask_view) == modes;
             if !(refused && same) {
                 wrong.push(format!("{cmd} {p}: {r:?}, document unchanged: {same}"));
             }
             if !same {
                 let st = s.doc_mut().unwrap();
-                (st.doc, st.selection) = (doc, selection);
+                (st.doc, st.selection, (st.isolation, st.mask_view)) = (doc, selection, modes);
                 st.history.undo.truncate(undo);
             }
         }

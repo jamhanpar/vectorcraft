@@ -19,10 +19,12 @@
 //! (`AIDeformArtWidthKey`, `AIDeformArtHeightKey`), the contents (`X=` … `X+`, then
 //! `(AIDeformArtKey)`) and the kind (`AIDeformStyle`: 1 a warp, 2 a mesh, 3 a top object). Then the
 //! distorted art on plain lines, and the plugin's `XP`. While the contents are edited, the group
-//! holds the contents and the dictionary the mesh. A top object's outline is the edge of its
-//! one-patch mesh. A warp's mesh is a grid of its shape: a warp of type whose own warp doesn't come
-//! out as drawn opens as a mesh envelope on that grid where that does. An envelope whose parts don't
-//! read, or that doesn't come out as drawn, keeps its drawn art.
+//! holds the contents and the dictionary the mesh, which in some files lies away from the drawn art
+//! by a move, as if it hadn't followed the envelope: such a mesh or top object whose grid draws its
+//! contents as large as the drawn art but elsewhere is tried again moved onto that art. A top
+//! object's outline is the edge of its one-patch mesh. A warp's mesh is a grid of its shape: a warp
+//! of type whose own warp doesn't come out as drawn opens as a mesh envelope on that grid where that
+//! does. An envelope whose parts don't read, or that doesn't come out as drawn, keeps its drawn art.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -62,6 +64,10 @@ const MAX_GRID: u32 = 50;
 /// How far, in points over width and height together, a saved size may lie from the contents'
 /// bounds with their strokes and still count as that box.
 const SAVED_SIZE_SLACK: f64 = 0.5;
+/// How far, in points over width and height together, what an envelope draws may differ in size
+/// from its drawn art and still count as that art moved, and how far it must lie from it to count
+/// as moved at all ([`moved_onto`]).
+const MOVED_SLACK: f64 = 0.5;
 /// The bits of the options word that are read: Distort Appearance, Distort Pattern Fills, Distort
 /// Linear Gradients, Anti-Alias (set: off) and Preserve Shape Using (set: Clipping Mask).
 const KNOWN_BITS: i64 = 0b111 | 1 << 16 | 1 << 17;
@@ -131,15 +137,48 @@ fn saved_margin(o: &Obj, content: &[Arc<Node>]) -> Option<[f32; 4]> {
     envelope_stroke_margin(stroked, plain)
 }
 
-/// Envelope `kind` mapping from its contents' bounds with their strokes, for an envelope with
-/// Distort Appearance whose contents have strokes it doesn't map from already; `None` otherwise.
+/// The box of `content` an envelope of type with Distort Appearance maps from in a file: type by
+/// its glyph outlines grown by as far as its strokes paint along a side (half the weight of a
+/// centred stroke), without what miter joins add at corners, as are groups by their own strokes;
+/// other objects by their bounds with strokes. `None` when nothing in it has bounds.
+fn half_stroked_box(content: &[Arc<Node>]) -> Option<Rect> {
+    /// How far the visible strokes of `appearance` paint along the sides of closed outlines.
+    fn along(appearance: &Appearance) -> f64 {
+        appearance.painted_strokes().map(|s| s.side_reach(true)).fold(0.0, f64::max)
+    }
+    /// `r` grown by `by` on each side, where that is a distance.
+    fn grown(r: Rect, by: f64) -> Rect {
+        if by.is_finite() && by > 0.0 { r.inflate(by, by) } else { r }
+    }
+    fn walk(n: &Arc<Node>, acc: Option<Rect>) -> Option<Rect> {
+        let one = std::slice::from_ref(n);
+        match &n.kind {
+            NodeKind::Text(t) => {
+                let Some((_, ink)) = envelope_content_boxes(one, Affine::IDENTITY) else { return acc };
+                // The characters' own strokes as the type's bounds with strokes measure them (they
+                // have no miter allowance there), and the strokes of its appearance along a side.
+                vectorcraft_geom::union_opt(acc, Some(grown(ink, t.char_stroke_outset().max(along(&n.appearance)))))
+            }
+            NodeKind::Group { children, clip: false } => {
+                let members = children.iter().fold(None, |acc, c| walk(c, acc));
+                vectorcraft_geom::union_opt(acc, members.map(|b| grown(b, along(&n.appearance))))
+            }
+            _ => vectorcraft_geom::union_opt(acc, envelope_content_boxes(one, Affine::IDENTITY).map(|(stroked, _)| stroked)),
+        }
+    }
+    content.iter().fold(None, |acc, c| walk(c, acc))
+}
+
+/// Envelope `kind` mapping from its contents' glyphs grown by as far as their strokes paint along a
+/// side ([`half_stroked_box`]), for an envelope with Distort Appearance whose contents have strokes it
+/// doesn't map from already; `None` otherwise.
 fn with_strokes(kind: &NodeKind) -> Option<NodeKind> {
     let NodeKind::Envelope { content, options, .. } = kind else { return None };
     if !options.distort_appearance {
         return None;
     }
-    let (stroked, plain) = envelope_content_boxes(content, Affine::IDENTITY)?;
-    let margin = envelope_stroke_margin(stroked, plain)?;
+    let (_, plain) = envelope_content_boxes(content, Affine::IDENTITY)?;
+    let margin = envelope_stroke_margin(half_stroked_box(content)?, plain)?;
     if margin == options.bounds_margin || margin.iter().any(|m| *m < 0.0) || margin.iter().all(|m| *m == 0.0) {
         return None;
     }
@@ -148,6 +187,40 @@ fn with_strokes(kind: &NodeKind) -> Option<NodeKind> {
         options.bounds_margin = margin;
     }
     Some(kind)
+}
+
+/// The kind of `envelope`, a mesh or a top object in Edit Contents, with its grid moved onto
+/// `drawn`, the drawn art the file saves for it, where what it draws is as large as that art (within
+/// [`MOVED_SLACK`]) but lies elsewhere (further than that): moved by as far as the drawn art's box
+/// lies from the box of what it draws. While the contents are edited, the grid is kept in the
+/// envelope's dictionary, and in some files it lies away from the drawn art by a move, the contents
+/// with the drawn art, as if the grid hadn't followed the envelope when it moved. `None` outside
+/// Edit Contents, for a warp (it maps from its contents' box, which lies with them), and where
+/// nothing is drawn. Symbol instances and pattern fills in the contents are measured as they are,
+/// not drawn out: where that makes the sizes differ, no move is tried.
+pub(super) fn moved_onto(envelope: &Node, drawn: &Node) -> Option<NodeKind> {
+    let NodeKind::Envelope { kind, editing: true, .. } = &envelope.kind else { return None };
+    if matches!(**kind, EnvelopeKind::Warp { .. }) {
+        return None;
+    }
+    // What it draws, measured as its drawn art is: the pieces in a group with its own appearance.
+    let mut drew = envelope.clone();
+    drew.kind = NodeKind::Group { children: vectorcraft_render::expand_live(envelope).into_iter().map(Arc::new).collect(), clip: false };
+    let (from, to) = (drew.visual_bounds()?, drawn.visual_bounds()?);
+    let by = to.center() - from.center();
+    let resized = (from.width() - to.width()).abs() + (from.height() - to.height()).abs();
+    if !(resized <= MOVED_SLACK && by.x.abs() + by.y.abs() > MOVED_SLACK && by.x.is_finite() && by.y.is_finite()) {
+        return None;
+    }
+    let mut moved = envelope.kind.clone();
+    if let NodeKind::Envelope { kind, .. } = &mut moved {
+        match &mut **kind {
+            EnvelopeKind::Mesh { points, .. } => points.iter_mut().for_each(|p| *p += by),
+            EnvelopeKind::TopObject { path, .. } => path.transform(Affine::translate(by)),
+            EnvelopeKind::Warp { .. } => return None,
+        }
+    }
+    Some(moved)
 }
 
 /// A warp: its style, bend, distortions and orientation.
@@ -518,7 +591,9 @@ impl WarpedType {
     /// doesn't draw as its drawn art is checked again as a mesh envelope on the grid the file saves
     /// for it ([`live_on_saved_grid`]), which opens in its place where it does: its type stays
     /// editable in that shape, and the warp's style and bend are lost. With Distort Appearance, each
-    /// is also checked mapping from its contents' bounds with their strokes ([`with_strokes`]). Each
+    /// is also checked mapping from its type's glyphs grown by half their strokes' weight
+    /// ([`with_strokes`]). In Edit Contents, a mesh or top object whose grid draws the type
+    /// elsewhere than its drawn art is checked last moved onto that art ([`moved_onto`]). Each
     /// check uses one of the import's checks and, for an envelope that shows, adds to what the page
     /// check allows ([`drawn_alike`]). Elsewhere, and where the type is set in a font that isn't
     /// available, the drawn art and the hidden type stay.
@@ -581,9 +656,9 @@ impl WarpedType {
         // A warp that VectorCraft's own warp doesn't draw as its drawn art may still draw as the
         // grid the file saves for it: then it opens as a mesh envelope on that grid.
         let on_grid = if is_warp(&obj) { live_on_saved_grid(&obj, before.clone(), inner.clone()) } else { None };
-        // With Distort Appearance, a file's envelope may map its contents from their bounds with
-        // their strokes or without them, and for type the size the file saves for that box is often
-        // out of date (not the size of the type there now): each is checked.
+        // With Distort Appearance, a file's envelope may map its type from its glyphs grown by half
+        // their strokes' weight or from the glyphs alone, and for type the size the file saves for
+        // that box is often out of date (not the size of the type there now): each is checked.
         let kinds: Vec<NodeKind> = live(&obj, before, inner)
             .into_iter()
             .chain(on_grid)
@@ -600,7 +675,17 @@ impl WarpedType {
         (plain.visible, plain.opacity) = (true, 1.0);
         let page = self.page.filter(|_| shown.contains(&drawn));
         let mut alike = None;
-        for (i, kind) in kinds.into_iter().enumerate() {
+        // In Edit Contents, a grid that draws the type elsewhere than its drawn art is tried again
+        // moved onto that art ([`moved_onto`]), after every other way.
+        let (mut tries, mut moved, mut again, mut i) = (kinds.into_iter(), vec![], false, 0);
+        loop {
+            let Some(kind) = tries.next() else {
+                if again || moved.is_empty() {
+                    break;
+                }
+                (tries, again) = (std::mem::take(&mut moved).into_iter(), true);
+                continue;
+            };
             // A second try is only made while more checks are left than there are envelopes of
             // type and warped text objects still to come (some of which may need none): one
             // envelope's tries don't use up the checks of the others.
@@ -608,6 +693,7 @@ impl WarpedType {
                 return Err(TypeKept::Budget);
             }
             self.checks -= 1;
+            i += 1;
             let mut envelope = art.clone();
             (envelope.id, envelope.kind) = (id, kind);
             let shared = Shared { patterns: &doc.patterns, images: &doc.images };
@@ -616,6 +702,9 @@ impl WarpedType {
             if drawn_alike(&live_one, &plain, layer, &shared, page, &mut self.spent) {
                 alike = Some(envelope);
                 break;
+            }
+            if !again && let Some(kind) = moved_onto(&live_one, &plain) {
+                moved.push(kind);
             }
         }
         let envelope = alike.ok_or(TypeKept::Differs)?;
@@ -771,4 +860,92 @@ fn alike_within(live: &Node, drawn: &Node, reach: Option<Rect>, layer: NodeId, s
     }
     *spent = Spent { any, solid };
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vectorcraft_color::{Color, Paint};
+    use vectorcraft_doc::{AppearanceItem, CharStyle, LineJoin, StrokeLayer, TextObject};
+
+    /// An envelope of `content` with Distort Appearance, on a flat one-patch mesh.
+    fn envelope_of(content: Vec<Arc<Node>>) -> NodeKind {
+        let points = vec![Point::new(0.0, 0.0), Point::new(100.0, 0.0), Point::new(0.0, 50.0), Point::new(100.0, 50.0)];
+        NodeKind::Envelope {
+            content,
+            kind: Box::new(EnvelopeKind::Mesh { rows: 1, cols: 1, points, handles: vec![] }),
+            fidelity: 50.0,
+            editing: false,
+            options: EnvelopeOptions::NEW,
+            frame: Box::default(),
+        }
+    }
+
+    /// The bounds margin of the stroked candidate for an envelope of `content`.
+    fn stroked_margin(content: Vec<Arc<Node>>) -> Option<[f32; 4]> {
+        match with_strokes(&envelope_of(content)) {
+            Some(NodeKind::Envelope { options, .. }) => Some(options.bounds_margin),
+            _ => None,
+        }
+    }
+
+    /// "AVA" at 40 points, at (10, 60).
+    fn type_node(id: u64, style: CharStyle) -> Node {
+        Node::new(NodeId(id), NodeKind::Text(Box::new(TextObject::point(Point::new(10.0, 60.0), "AVA", CharStyle { size: 40.0, ..style }))))
+    }
+
+    /// A 4 point stroke with miter joins at a limit of 4.
+    fn mitred() -> StrokeLayer {
+        let mut stroke = StrokeLayer::new(Paint::solid(Color::BLACK), 4.0);
+        (stroke.join, stroke.miter_limit) = (LineJoin::Miter, 4.0);
+        stroke
+    }
+
+    /// Type with Distort Appearance and a stroke from its appearance is tried mapped from its glyphs
+    /// grown by half the stroke's weight, not from its bounds with strokes, which reach as far as a
+    /// miter join may at a corner.
+    #[test]
+    fn stroked_type_is_tried_mapped_from_its_glyphs_grown_by_half_its_stroke() {
+        let mut text = type_node(1, CharStyle::default());
+        let mut appearance = (*text.appearance).clone();
+        appearance.items.push(AppearanceItem::Stroke(mitred()));
+        text.appearance = appearance.into();
+        let content = vec![Arc::new(text)];
+        let (with, glyphs) = envelope_content_boxes(&content, Affine::IDENTITY).unwrap();
+        let half = glyphs.inflate(2.0, 2.0);
+        assert!(with.width() > half.width() + 1.0, "{with:?} {half:?}");
+        assert_eq!(stroked_margin(content), envelope_stroke_margin(half, glyphs));
+    }
+
+    /// Type stroked by its characters alone is tried mapped from its bounds with strokes, as before,
+    /// turned and stretched as well as upright.
+    #[test]
+    fn type_with_a_character_stroke_is_tried_mapped_from_its_bounds_with_strokes() {
+        let style = CharStyle { stroke: Paint::solid(Color::BLACK), stroke_width: 4.0, ..CharStyle::default() };
+        for xf in [
+            Affine::IDENTITY,
+            Affine::rotate(std::f64::consts::FRAC_PI_4),
+            Affine::scale_non_uniform(std::f64::consts::SQRT_2, std::f64::consts::FRAC_1_SQRT_2),
+        ] {
+            let mut text = type_node(1, style.clone());
+            if let NodeKind::Text(t) = &mut text.kind {
+                t.xf = xf * t.xf;
+            }
+            let content = vec![Arc::new(text)];
+            let (with, glyphs) = envelope_content_boxes(&content, Affine::IDENTITY).unwrap();
+            assert_eq!(stroked_margin(content), envelope_stroke_margin(with, glyphs), "{xf:?}");
+        }
+    }
+
+    /// A stroke on a group's own appearance round type grows the box by half its weight too.
+    #[test]
+    fn a_stroke_on_a_group_of_type_grows_the_box_by_half_its_weight() {
+        let mut group = Node::new(NodeId(2), NodeKind::Group { children: vec![Arc::new(type_node(1, CharStyle::default()))], clip: false });
+        let mut appearance = (*group.appearance).clone();
+        appearance.items.push(AppearanceItem::Stroke(mitred()));
+        group.appearance = appearance.into();
+        let content = vec![Arc::new(group)];
+        let (_, glyphs) = envelope_content_boxes(&content, Affine::IDENTITY).unwrap();
+        assert_eq!(stroked_margin(content), envelope_stroke_margin(glyphs.inflate(2.0, 2.0), glyphs));
+    }
 }
