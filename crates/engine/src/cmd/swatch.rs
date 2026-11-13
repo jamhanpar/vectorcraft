@@ -84,7 +84,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Select All Unused",
             ["Window", "Swatches"],
             None,
-            "{} → {names: [the swatches nothing uses, in panel order]}: a colour is used when a paint links to it or an unlinked paint, gradient stop or mesh point has its colour; a gradient when a gradient links to it or has its stops; a pattern when it fills or strokes anything (art, symbols, pattern tiles and graphic styles count). None is never listed",
+            "{} → {names: [the swatches nothing uses, in panel order]}: a colour is used when a paint links to it or an unlinked paint, gradient stop or mesh point has its colour; a gradient when a gradient links to it or has its stops; a pattern when it fills or strokes anything (art, symbols, pattern tiles and graphic styles count); a color, spot or process, when an image placed from a DCS file that the art shows has a spot plate of its name. None is never listed",
             has_doc,
             swatch_unused
         ),
@@ -393,11 +393,12 @@ fn float_key(v: f32) -> Option<u32> {
 /// keys.
 type StopKey<'a> = (u32, ColorKey, u32, u32, Option<&'a str>, u32, Option<[u32; 4]>);
 
-/// A gradient's kind, method, dither and stops, as keys.
-type GradientKey<'a> = (u8, u8, bool, Vec<StopKey<'a>>);
+/// A gradient's kind, method, dither, spread and count as it paints them, and stops, as keys.
+type GradientKey<'a> = (u8, u8, bool, (vectorcraft_color::GradientSpread, u32), Vec<StopKey<'a>>);
 
-/// A key that is equal for two gradients exactly when the gradients are equal (`==`); `None` when
-/// any of its numbers is NaN, so the gradient equals no gradient.
+/// A key that is equal for two gradients exactly when the gradients are equal (`==`), apart from
+/// a count that a gradient which pads does not use ([`Gradient::painted_spread`]); `None` when any
+/// of its numbers is NaN, so the gradient equals no gradient.
 fn gradient_key(g: &Gradient) -> Option<GradientKey<'_>> {
     let kind = match g.kind {
         GradientKind::Linear => 0,
@@ -410,7 +411,7 @@ fn gradient_key(g: &Gradient) -> Option<GradientKey<'_>> {
         GradientMethod::Classic => 0,
         GradientMethod::Perceptual => 1,
     };
-    Some((kind, method, g.dither, g.stops.iter().map(stop_key).collect::<Option<_>>()?))
+    Some((kind, method, g.dither, g.painted_spread(), g.stops.iter().map(stop_key).collect::<Option<_>>()?))
 }
 
 /// A stop's key for [`gradient_key`]; `None` when any of its numbers is NaN.
@@ -987,8 +988,28 @@ fn swatch_unused(s: &mut Session, _: &Value) -> Result<Value> {
     let colors: HashSet<ColorKey> = colors.iter().filter_map(color_key).collect();
     let patterns: HashSet<&String> = patterns.iter().collect();
     let gradients: HashSet<GradientKey> = gradients.iter().filter_map(gradient_key).collect();
+    // The spot inks the images placed from DCS files have plates for: their swatches print them.
+    // Only images the art shows count: a deleted one's pixels stay for undo.
+    let mut shown: HashSet<&str> = HashSet::new();
+    for root in d
+        .layers
+        .iter()
+        .chain(d.symbols.iter().map(|s| &s.art))
+        .chain(d.graph_designs.iter().map(|g| &g.art))
+        .chain(d.patterns.iter().flat_map(|p| &p.art))
+    {
+        vectorcraft_doc::swatches::walk_with_masks(root, &mut |n| {
+            if let vectorcraft_doc::NodeKind::Image(im) = &n.kind {
+                shown.insert(im.key.as_str());
+            }
+        });
+    }
+    let plate_inks: HashSet<String> =
+        shown.iter().filter_map(|k| d.images.get(*k)).flat_map(vectorcraft_doc::ImageBlob::spot_plates).map(|(name, _)| name).collect();
     let used = |w: &Swatch| {
         gradient_links.contains(&w.name)
+            // A spot swatch prints the plate; a process one gives the color it prints as process.
+            || (w.paint.color().is_some() && plate_inks.contains(&w.name))
             || match w.tint_of() {
                 Some((base, tint)) => float_key(tint).is_some_and(|t| link_tints.contains(&(base, t))),
                 None => link_names.contains(w.name.as_str()),

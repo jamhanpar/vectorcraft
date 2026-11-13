@@ -26,9 +26,12 @@ const NUMBERS: &[&str] = &["size", "leading", "kerning", "tracking"];
 /// The on, off or unset checkboxes.
 const SWITCHES: &[&str] = &["underline", "strikethrough", "standardVerticalRoman"];
 /// The attributes of Advanced Character Formats, in the order the section shows them.
-const ADVANCED: &[&str] = &["h_scale", "v_scale", "baseline_shift", "tcyUpDown", "tcyLeftRight", "rotation", "language"];
+const ADVANCED: &[&str] = &["h_scale", "v_scale", "baseline_shift", "tcyUpDown", "tcyLeftRight", "rotation", "akiLeft", "akiRight", "language"];
 /// The number fields of Advanced Character Formats.
-const ADVANCED_NUMBERS: &[&str] = &["h_scale", "v_scale", "baseline_shift", "tcyUpDown", "tcyLeftRight", "rotation"];
+const ADVANCED_NUMBERS: &[&str] = &["h_scale", "v_scale", "baseline_shift", "tcyUpDown", "tcyLeftRight", "rotation", "akiLeft", "akiRight"];
+/// The Insert Aki Left and Right fields, which take the Character panel's presets and stop at
+/// [`vectorcraft_doc::text::MAX_AKI`].
+const AKI: [&str; 2] = ["akiLeft", "akiRight"];
 /// The attributes of Character Color.
 const COLOR: &[&str] = &["fill", "stroke", "stroke_width", "overprint_fill", "overprint_stroke"];
 /// The fields of Character Color: the fill and stroke paints, their tints in percent, the stroke
@@ -81,6 +84,8 @@ pub(super) const SPEC: DialogSpec = DialogSpec {
             "tcyUpDown",
             "tcyLeftRight",
             "rotation",
+            "akiLeft",
+            "akiRight",
             "language",
             "fill",
             "fill_tint",
@@ -186,9 +191,22 @@ pub(crate) fn swatch_choices(doc: &vectorcraft_doc::Document) -> Value {
     Value::Array(choices.collect())
 }
 
-/// A feature tag without its `-` or `+`.
+/// A feature tag without its `-` or `+` prefix and its `=N` value.
 fn bare(tag: &str) -> &str {
-    tag.trim_start_matches(['-', '+'])
+    let tag = tag.trim_start_matches(['-', '+']);
+    tag.split_once('=').map_or(tag, |(name, _)| name)
+}
+
+/// Is the feature a tag of a style's list sets on? A `tag=N` of a valued feature is off for 0,
+/// which a `-` prefix check misses; every other tag is on unless it starts with `-`.
+fn tag_on(tag: &str) -> bool {
+    let name = bare(tag);
+    let valued = name == "swsh" || vectorcraft_text::EXTRA_FEATURES.contains(&name);
+    if valued && vectorcraft_text::OtFeatures::known_tag(tag) {
+        vectorcraft_text::OtFeatures::from_tags([tag]).feature_value(name).is_some()
+    } else {
+        !tag.starts_with('-')
+    }
 }
 
 /// The OpenType Features fields for a style's `features`: each control is unset unless the list
@@ -201,9 +219,9 @@ fn opentype_fields(features: Option<&Value>) -> Map<String, Value> {
     let mut fields = Map::new();
     for (field, tag) in OT_SWITCHES {
         let last = tags.iter().rev().find(|t| bare(t) == *tag);
-        fields.insert((*field).into(), last.map_or(Value::Null, |t| json!(!t.starts_with('-'))));
+        fields.insert((*field).into(), last.map_or(Value::Null, |t| json!(tag_on(t))));
     }
-    let last_on = |tag: &str| tags.iter().rev().find(|t| bare(t) == tag).map(|t| !t.starts_with('-'));
+    let last_on = |tag: &str| tags.iter().rev().find(|t| bare(t) == tag).map(|t| tag_on(t));
     let figure = names(&FIGURE_TAGS)
         .then(|| FIGURE_VALUES.get(crate::panels::opentype::figure(&f)))
         .flatten()
@@ -214,7 +232,7 @@ fn opentype_fields(features: Option<&Value>) -> Map<String, Value> {
     fields.insert("ot_position".into(), position.map_or(Value::Null, |v| json!(v)));
     let sets: Vec<String> = vectorcraft_text::EXTRA_FEATURES[..20]
         .iter()
-        .filter_map(|set| tags.iter().rev().find(|t| bare(t) == *set).map(|t| if t.starts_with('-') { format!("-{set}") } else { set.to_string() }))
+        .filter_map(|set| tags.iter().rev().find(|t| bare(t) == *set).map(|t| if tag_on(t) { set.to_string() } else { format!("-{set}") }))
         .collect();
     fields.insert("ot_sets".into(), if sets.is_empty() { Value::Null } else { json!(sets) });
     fields
@@ -255,6 +273,8 @@ fn optional_number(d: &Dialog, key: &str) -> Result<Option<Value>, String> {
         "tcyUpDown" => tl!("Tate-chu-yoko Up/Down"),
         "tcyLeftRight" => tl!("Tate-chu-yoko Left/Right"),
         "rotation" => tl!("Character Rotation"),
+        "akiLeft" => tl!("Insert Aki Left"),
+        "akiRight" => tl!("Insert Aki Right"),
         "fill_tint" => tl!("Fill Tint"),
         "stroke_tint" => tl!("Stroke Tint"),
         "stroke_width" => tl!("Weight"),
@@ -299,6 +319,9 @@ fn optional_number(d: &Dialog, key: &str) -> Result<Option<Value>, String> {
             }
             // An angle from -180 to 180 degrees, as text.setFormat stores it.
             let n = if key == "rotation" { (n + 180.0).rem_euclid(360.0) - 180.0 } else { n };
+            // Insert Aki stops at 0 and at the largest value the style takes, as the Character
+            // panel's fields do.
+            let n = if AKI.contains(&key) { n.clamp(0.0, vectorcraft_doc::text::MAX_AKI) } else { n };
             Ok(Some(json!(n)))
         }
     }
@@ -492,9 +515,18 @@ fn opentype_attrs(d: &Dialog, original: &Map<String, Value>, original_fields: &M
     }
     if !unchanged("ot_sets") {
         let sets = &vectorcraft_text::EXTRA_FEATURES[..20];
+        // A set still on keeps the value its tag gives (`ss01=2`).
+        let before: Vec<String> = tags.iter().filter(|t| sets.contains(&bare(t))).cloned().collect();
         tags.retain(|t| !sets.contains(&bare(t)));
         let listed = d.fields.get("ot_sets").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str);
-        tags.extend(listed.filter(|t| sets.contains(&bare(t))).map(str::to_string));
+        tags.extend(listed.filter(|t| sets.contains(&bare(t))).map(|t| {
+            let kept = before
+                .iter()
+                .rev()
+                .find(|b| bare(b) == bare(t))
+                .filter(|b| !t.starts_with('-') && vectorcraft_text::OtFeatures::known_tag(b) && tag_on(b));
+            kept.map_or_else(|| t.to_string(), Clone::clone)
+        }));
     }
     if !tags.is_empty() {
         attrs.insert("features".into(), json!(tags));
@@ -568,7 +600,7 @@ pub(crate) fn reset_basic(d: &mut Dialog) {
     }
 }
 
-/// Reset Panel in Advanced Character Formats: its seven attributes become unset.
+/// Reset Panel in Advanced Character Formats: its nine attributes become unset.
 pub(crate) fn reset_advanced(d: &mut Dialog) {
     d.fields.insert("__resetAdvanced".into(), json!(true));
     for key in ADVANCED_NUMBERS {
@@ -723,7 +755,8 @@ pub(crate) fn basic_body(ui: &mut egui::Ui, d: &mut Dialog) {
 }
 
 /// Advanced Character Formats: Horizontal Scale, Vertical Scale, Baseline Shift, the Tate-chu-yoko
-/// Up/Down and Left/Right, Character Rotation and Language, each empty (unset) or set.
+/// Up/Down and Left/Right, Character Rotation, Insert Aki Left and Right (with the Character
+/// panel's presets) and Language, each empty (unset) or set.
 pub(crate) fn advanced_body(ui: &mut egui::Ui, d: &mut Dialog) {
     egui::Grid::new("character-style-advanced").num_columns(2).spacing([18.0, 8.0]).show(ui, |ui| {
         for (key, caption, unit) in [
@@ -742,6 +775,16 @@ pub(crate) fn advanced_body(ui: &mut egui::Ui, d: &mut Dialog) {
                 ui.label_inputs_by(row.id, |ui| form::text(ui, d, key, 160.0));
                 ui.label(unit);
             });
+            ui.end_row();
+        }
+        let presets: Vec<String> = crate::panels::character::AKI_PRESETS.iter().map(f64::to_string).collect();
+        let presets: Vec<&str> = presets.iter().map(String::as_str).collect();
+        for (key, caption) in [("akiLeft", tl!("Insert Aki Left")), ("akiRight", tl!("Insert Aki Right"))] {
+            let row = ui.label(caption);
+            let value = if d.fields.get(key).is_none_or(Value::is_null) { String::new() } else { d.str(key) };
+            if let Some(v) = ui.label_inputs_by(row.id, |ui| crate::widgets::text_presets(ui, (KIND, key), &value, &presets, 160.0)) {
+                d.fields.insert(key.into(), json!(v));
+            }
             ui.end_row();
         }
         let row = ui.label(tl!("Language:"));
@@ -1662,6 +1705,60 @@ mod tests {
         assert_eq!(def.attrs["tcyLeftRight"], json!(6.0));
     }
 
+    #[test]
+    fn insert_aki_fields_show_set_reset_and_stop_at_the_character_panel_limits() {
+        let d = dialog_for(json!({"akiLeft": 250.0, "size": 12.0}));
+        assert_eq!((d.fields["akiLeft"].clone(), d.fields["akiRight"].clone()), (json!(250.0), json!("")));
+        assert_eq!(edited_attrs(&d).unwrap(), attrs(json!({"akiLeft": 250.0, "size": 12.0})));
+
+        let mut d = dialog_for(json!({"akiLeft": 250.0}));
+        d.fields.insert("akiLeft".into(), json!(""));
+        d.fields.insert("akiRight".into(), json!("500"));
+        assert_eq!(edited_attrs(&d).unwrap(), attrs(json!({"akiRight": 500.0})));
+        // A typed value stops at 0 and at 1000, as in the Character panel's fields.
+        for (typed, kept) in [("5000", 1000.0), ("-5", 0.0), ("1000", 1000.0)] {
+            d.fields.insert("akiRight".into(), json!(typed));
+            assert_eq!(edited_attrs(&d).unwrap(), attrs(json!({"akiRight": kept})), "{typed}");
+        }
+        d.fields.insert("akiLeft".into(), json!("wide"));
+        assert_eq!(edited_attrs(&d).unwrap_err(), "Insert Aki Left must be a number");
+
+        let mut d = dialog_for(json!({"akiLeft": 250.0, "akiRight": 500.0, "size": 12.0}));
+        d.fields.insert("section".into(), json!("advanced"));
+        reset_section(&mut d);
+        assert_eq!(edited_attrs(&d).unwrap(), attrs(json!({"size": 12.0})));
+    }
+
+    #[test]
+    fn insert_aki_fields_are_drawn_and_commit_to_the_style_and_its_text() {
+        let mut app = app();
+        app.run("charStyle.new", json!({"name": "Body", "attrs": {"size": 24.0}})).unwrap();
+        let id = app.run("text.create", json!({"x": 10, "y": 40, "text": "Text"})).unwrap()["id"].as_u64().unwrap();
+        app.run("charStyle.apply", json!({"name": "Body", "id": id})).unwrap();
+        open(&mut app, "Body").unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 900.0));
+        let mut d = app.ui.dialog.clone().unwrap();
+        let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| advanced_body(ui, &mut d));
+        let texts = texts_of(&out);
+        out.textures_delta.clear();
+        for label in ["Insert Aki Left", "Insert Aki Right"] {
+            assert!(texts.iter().any(|(text, _)| text == label), "{label} is drawn: {texts:?}");
+        }
+        {
+            let d = app.ui.dialog.as_mut().unwrap();
+            d.fields.insert("akiLeft".into(), json!("250"));
+            d.fields.insert("akiRight".into(), json!("2000"));
+        }
+        super::super::confirm(&mut app).unwrap();
+        let state = app.session.doc().unwrap();
+        assert_eq!(state.doc.char_styles[0].attrs, attrs(json!({"size": 24.0, "akiLeft": 250.0, "akiRight": 1000.0})));
+        let vectorcraft_doc::NodeKind::Text(t) = &state.doc.node(vectorcraft_doc::NodeId(id)).unwrap().kind else { panic!("text") };
+        assert!(t.runs.iter().all(|r| (r.style.aki_left, r.style.aki_right) == (250.0, 1000.0)));
+    }
+
     /// The negated tags of the twenty stylistic sets: an explicit empty Stylistic Sets choice.
     fn no_sets() -> Vec<String> {
         vectorcraft_text::EXTRA_FEATURES[..20].iter().map(|s| format!("-{s}")).collect()
@@ -1722,6 +1819,21 @@ mod tests {
         let mut d = dialog_for(json!({"features": ["dlig"]}));
         d.fields.insert("ot_dlig".into(), Value::Null);
         assert_eq!(edited_attrs(&d).unwrap(), Map::new());
+    }
+
+    #[test]
+    fn a_stored_zero_value_reads_as_off_and_turning_it_on_saves_it() {
+        let mut d = dialog_for(json!({"features": ["ss01=0", "salt=0", "ss02=2"]}));
+        assert_eq!(d.fields["ot_salt"], json!(false));
+        assert_eq!(d.fields["ot_sets"], json!(["-ss01", "ss02"]));
+        d.fields.insert("ot_sets".into(), json!(["ss01", "ss02"]));
+        d.fields.insert("ot_salt".into(), json!(true));
+        assert_eq!(edited_attrs(&d).unwrap()["features"], json!(["salt", "ss01", "ss02=2"]));
+        for last in ["ss01=0", "-ss01", "ss01=65536"] {
+            let mut d = dialog_for(json!({"features": ["ss01=2", last]}));
+            d.fields.insert("ot_sets".into(), json!(["ss01", "ss02"]));
+            assert_eq!(edited_attrs(&d).unwrap()["features"], json!(["ss01", "ss02"]), "{last}: only a valid last on-value is kept");
+        }
     }
 
     #[test]
