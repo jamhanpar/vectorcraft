@@ -1,3 +1,4 @@
+use serde_json::json;
 use vectorcraft_color::{Color, Paint};
 use vectorcraft_doc::{Appearance, Document, Node, NodeId, NodeKind, StrokeLayer};
 use vectorcraft_geom::{Affine, BezPath, Point, Rect, Vec2, shapes};
@@ -824,6 +825,86 @@ fn bristle_makes_translucent_strands() {
     assert!(out.iter().all(|n| n.opacity < 1.0 && n.opacity > 0.0));
     let bb = bounds(&out);
     assert!(bb.height() <= 6.0 * 1.3 && bb.height() >= 3.0, "{bb:?}");
+}
+
+#[test]
+fn bristle_pen_pressure_changes_its_footprint() {
+    let b = Brush { name: "b".into(), kind: BrushKind::Bristle(Bristle::default()) };
+    let render = |pressure| {
+        let s = StrokeLayer { pressure: Some(vectorcraft_doc::PressureProfile { points: vec![(0.0, pressure), (1.0, pressure)] }), ..stroke(1.0) };
+        stroke_pieces(&Document::new(1.0, 1.0), &b, &line(0.0, 0.0, 200.0, 0.0), &s)
+    };
+    let light = render(0.0);
+    let heavy = render(1.0);
+    assert_eq!(light.len(), heavy.len());
+    assert!(bounds(&heavy).height() > bounds(&light).height() * 1.8);
+}
+
+#[test]
+fn bristle_pen_pressure_is_sampled_along_the_stroke() {
+    let b = Brush { name: "b".into(), kind: BrushKind::Bristle(Bristle::default()) };
+    let s = StrokeLayer { pressure: Some(vectorcraft_doc::PressureProfile { points: vec![(0.0, 0.0), (1.0, 1.0)] }), ..stroke(1.0) };
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &b, &line(0.0, 0.0, 200.0, 0.0), &s);
+    let mut points = Vec::new();
+    for n in &out {
+        all_points(n, &mut points);
+    }
+    let early = points.iter().filter(|p| p.x > 20.0 && p.x < 60.0).map(|p| p.y.abs()).fold(0.0_f64, f64::max);
+    let late = points.iter().filter(|p| p.x > 140.0 && p.x < 180.0).map(|p| p.y.abs()).fold(0.0_f64, f64::max);
+    assert!(late > early * 1.4, "spread along stroke: {early} -> {late}");
+}
+
+#[test]
+fn trimmed_bristle_strands_read_pressure_where_they_begin() {
+    let b = Brush { name: "b".into(), kind: BrushKind::Bristle(Bristle { size: 20.0, length: 300.0, ..Default::default() }) };
+    let render = |points| {
+        let s = StrokeLayer { pressure: Some(vectorcraft_doc::PressureProfile { points }), ..stroke(1.0) };
+        stroke_pieces(&Document::new(1.0, 1.0), &b, &line(0.0, 0.0, 80.0, 0.0), &s)
+    };
+    let ramp = render(vec![(0.0, 0.0), (1.0, 1.0)]);
+    let neutral = render(vec![(0.0, 0.5), (1.0, 0.5)]);
+    assert_eq!(ramp.len(), neutral.len());
+    let start = |n: &Node| {
+        let anchors = &n.path_data().unwrap().subpaths[0].anchors;
+        let first = anchors[0].p;
+        let opposite = anchors[anchors.len() - 16].p;
+        (first.x, (first.y - opposite.y).abs())
+    };
+    let mut checked = false;
+    for (ramp, neutral) in ramp.iter().zip(&neutral) {
+        let (x, width) = start(ramp);
+        if x < 12.0 {
+            continue;
+        }
+        let (_, neutral_width) = start(neutral);
+        let expected = 0.5 + x / 80.0;
+        assert!(width / neutral_width > expected - 0.08, "strand at {x}: {width} vs {neutral_width}, expected ratio {expected}");
+        checked = true;
+    }
+    assert!(checked, "at least one strand begins past the pressure ramp's first eighth");
+}
+
+#[test]
+fn bristle_pen_orientation_changes_its_footprint() {
+    let b = Brush { name: "b".into(), kind: BrushKind::Bristle(Bristle::default()) };
+    let render = |tilt, bearing, rotation| {
+        let flat = |x| vec![(0.0, x), (1.0, x)];
+        let s = StrokeLayer {
+            tilt: Some(vectorcraft_doc::PressureProfile { points: flat(tilt) }),
+            bearing: Some(vectorcraft_doc::AngleProfile { points: flat(bearing) }),
+            rotation: Some(vectorcraft_doc::AngleProfile { points: flat(rotation) }),
+            ..stroke(1.0)
+        };
+        stroke_pieces(&Document::new(1.0, 1.0), &b, &line(0.0, 0.0, 200.0, 0.0), &s)
+    };
+    let neutral = bounds(&render(0.5, 0.0, 0.0)).height();
+    let flat = bounds(&render(1.0, 0.0, 0.0)).height();
+    let upright = bounds(&render(0.0, 0.0, 0.0)).height();
+    let bearing = bounds(&render(0.5, 90.0, 0.0)).height();
+    let rotation = bounds(&render(0.5, 0.0, 90.0)).height();
+    assert!(flat > neutral && neutral > upright, "tilt: {flat} > {neutral} > {upright}");
+    assert!(bearing < neutral * 0.7, "bearing: {bearing} vs {neutral}");
+    assert!(rotation < neutral * 0.7, "rotation: {rotation} vs {neutral}");
 }
 
 #[test]
@@ -2036,4 +2117,101 @@ fn a_straight_run_keeps_the_same_node_kinds_as_a_bend() {
             assert_eq!(kinds(n), ["group", "path"], "{what} keeps the path and drops the symbol instance");
         }
     }
+}
+
+/// `options` as a stroke's own brush settings.
+fn with_options(options: serde_json::Value) -> StrokeLayer {
+    StrokeLayer { brush_options: options.as_object().cloned().unwrap_or_default(), ..stroke(1.0) }
+}
+
+#[test]
+fn a_strokes_own_options_change_its_art_and_leave_the_brush() {
+    let doc = Document::new(1.0, 1.0);
+    let brush = art_brush(rect_art(10.0, 4.0), ArtScale::Stretch);
+    let path = line(20.0, 50.0, 220.0, 50.0);
+    let half = stroke_pieces(&doc, &brush, &path, &with_options(json!({"width": 50.0})));
+    assert!(near(bounds(&half).height(), 2.0, 1e-6), "width 50% halves the art across the stroke: {:?}", bounds(&half));
+    assert!(near(bounds(&stroke_pieces(&doc, &brush, &path, &stroke(1.0))).height(), 4.0, 1e-6), "a stroke without options draws the brush");
+    let BrushKind::Art(a) = &brush.kind else { panic!("art brush") };
+    assert_eq!(a.width, 100.0, "the brush keeps its width");
+    // A calligraphic stroke's own size and angle.
+    let nib = stroke_pieces(&doc, &calli(0.0, 20.0, 10.0), &line(0.0, 0.0, 100.0, 0.0), &with_options(json!({"angle": 90.0})));
+    assert!(near(bounds(&nib).height(), 10.0, 0.05), "{:?}", bounds(&nib));
+    // A pattern stroke's own scale doubles the tiles across it.
+    let pattern = pattern_brush(PatternFit::Stretch, false);
+    let plain = bounds(&stroke_pieces(&doc, &pattern, &path, &stroke(1.0))).height();
+    let doubled = bounds(&stroke_pieces(&doc, &pattern, &path, &with_options(json!({"scale": 200.0})))).height();
+    assert!(near(doubled, plain * 2.0, 1e-6), "{plain} → {doubled}");
+}
+
+#[test]
+fn stroke_options_are_checked_and_kept_within_their_ranges() {
+    let brush = art_brush(rect_art(10.0, 4.0), ArtScale::Stretch);
+    let map = |v: serde_json::Value| v.as_object().cloned().unwrap_or_default();
+    // Out of range: clamped; equal to the brush's own value: left out.
+    let got = brush.stroke_options_that_differ(&map(json!({"width": 5000.0, "flip_along": false}))).unwrap();
+    assert_eq!(serde_json::Value::Object(got), json!({"width": 1000.0}));
+    // A field the type does not take, and a value of the wrong kind, are errors.
+    assert!(brush.stroke_options_that_differ(&map(json!({"angle": 10.0}))).unwrap_err().contains("angle"));
+    assert!(brush.stroke_options_that_differ(&map(json!({"width": "wide"}))).is_err());
+    let bristle = Brush { name: "b".into(), kind: BrushKind::Bristle(Bristle::default()) };
+    assert!(bristle.stroke_options_that_differ(&map(json!({"size": 2.0}))).is_err());
+    assert!(bristle.stroke_options_that_differ(&map(json!({}))).unwrap().is_empty());
+    // A colorization object changes only the fields it gives: Hue Shift keeps the key it has.
+    let key = Color::rgb(0.0, 0.0, 1.0);
+    let hue = Brush {
+        name: "h".into(),
+        kind: BrushKind::Art(ArtBrush { art: rect_art(10.0, 4.0), colorization: Colorization::HueShift { key }, ..Default::default() }),
+    };
+    let tints = hue.with_stroke_options(&map(json!({"colorization": {"method": "tints"}}))).unwrap();
+    assert_eq!(tints.kind.colorization(), Colorization::Tints);
+    let back = hue.stroke_options_that_differ(&map(json!({"colorization": {"method": "hueShift"}}))).unwrap();
+    assert!(back.is_empty(), "the brush's own colorization: {back:?}");
+    // Hue Shift without a key takes the art's main color, as brush.options gives it.
+    let keyless = tints.stroke_options_that_differ(&map(json!({"colorization": {"method": "hueShift"}}))).unwrap();
+    let want = art_colors(tints.art()).first().copied().unwrap_or(Color::BLACK);
+    assert_eq!(keyless["colorization"]["method"], json!("hueShift"));
+    assert_eq!(keyless["colorization"]["key"], serde_json::to_value(want).unwrap());
+    // Settings that do not read draw the brush as it is.
+    let doc = Document::new(1.0, 1.0);
+    let path = line(20.0, 50.0, 220.0, 50.0);
+    let odd = stroke_pieces(&doc, &brush, &path, &with_options(json!({"width": [1, 2]})));
+    assert!(near(bounds(&odd).height(), 4.0, 1e-6));
+}
+
+#[test]
+fn null_stroke_option_items_keep_the_items_the_stroke_has() {
+    let map = |v: serde_json::Value| v.as_object().cloned().unwrap_or_default();
+    // A scatter brush at fixed sizes, with no modes of its own: they follow its values.
+    let b = Brush { name: "s".into(), kind: BrushKind::Scatter(Scatter { size: (100.0, 100.0), ..Default::default() }) };
+    let BrushKind::Scatter(s) = b.with_stroke_options(&map(json!({"size": [null, 150]}))).unwrap().kind else { panic!("scatter") };
+    assert_eq!(s.size, (100.0, 150.0), "the smallest size stays the brush's");
+    // A stroke whose sizes vary keeps that random size mode when it sets only the spacing mode.
+    let e = b.with_stroke_options(&map(json!({"size": [50, 80], "modes": [null, "pressure", null, null]}))).unwrap();
+    let BrushKind::Scatter(s) = e.kind else { panic!("scatter") };
+    assert_eq!(s.modes(), [Variation::Random, Variation::Pressure, Variation::Fixed, Variation::Fixed]);
+    // The kept modes follow the values as they are kept within their ranges.
+    let c = calli(0.0, 100.0, 3.0).with_stroke_options(&map(json!({"variation": [-2, 0, 0], "modes": [null, "pressure", null]}))).unwrap();
+    let BrushKind::Calligraphic(c) = c.kind else { panic!("calligraphic") };
+    assert_eq!(c.modes(), [Variation::Fixed, Variation::Pressure, Variation::Fixed]);
+    // Modes that change nothing are no setting of the stroke's: they keep following its values.
+    let same = b.stroke_options_that_differ(&map(json!({"modes": [null, null, null, null]}))).unwrap();
+    assert!(same.is_empty(), "{same:?}");
+}
+
+#[test]
+fn a_null_calligraphic_modes_setting_stays_when_another_value_changes() {
+    let map = |v: serde_json::Value| v.as_object().cloned().unwrap_or_default();
+    // A brush whose modes are its own, and a stroke whose modes follow its values instead.
+    let mut b = calli(0.0, 100.0, 3.0);
+    if let BrushKind::Calligraphic(c) = &mut b.kind {
+        c.modes = Some([Variation::Pressure; 3]);
+    }
+    let got = b.stroke_options_that_differ(&map(json!({"modes": null, "angle": 30.0}))).unwrap();
+    assert_eq!(serde_json::Value::Object(got), json!({"modes": null, "angle": 30.0}));
+    let BrushKind::Calligraphic(c) = b.with_stroke_options(&map(json!({"modes": null, "angle": 30.0}))).unwrap().kind else { panic!("calligraphic") };
+    assert_eq!(c.modes(), [Variation::Fixed; 3], "the stroke draws with the modes its values give");
+    // A brush whose modes follow its values: a null `modes` is the brush's own and is left out.
+    let plain = calli(0.0, 100.0, 3.0).stroke_options_that_differ(&map(json!({"modes": null}))).unwrap();
+    assert!(plain.is_empty(), "{plain:?}");
 }

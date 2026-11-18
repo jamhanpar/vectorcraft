@@ -15,9 +15,11 @@ use vectorcraft_pathops::BoolOp;
 use crate::ai_ops::{self, unit};
 use crate::ps;
 
+mod blends;
 mod brushes;
 mod envelopes;
 mod images;
+mod meshes;
 mod paints;
 mod styles;
 mod symbols;
@@ -25,17 +27,22 @@ mod texts;
 mod variables;
 
 #[cfg(test)]
+pub(super) use blends::BLENDS;
+pub(super) use blends::unbaked_blends;
+#[cfg(test)]
 pub(super) use brushes::BRUSHES;
 #[cfg(test)]
 pub(super) use envelopes::ENVELOPES;
+#[cfg(test)]
+pub(super) use meshes::MESHES;
 pub(super) use styles::{LARGE_CANVAS_STYLES, style_links, styled_definitions, styled_objects};
 #[cfg(test)]
-pub(super) use styles::{PANEL_EMPTY, PANEL_STYLES, STYLE_LINKS, WARPED_IMAGES, same_appearance};
+pub(super) use styles::{PANEL_EMPTY, PANEL_STYLES, REPARSE, STYLE_LINKS, WARPED_IMAGES, same_appearance};
 pub(super) use texts::wraps_held;
 
 pub(super) use images::PAYLOAD;
 #[cfg(test)]
-pub(super) use images::{IMAGE_DEPTH, IMAGES, LINKS_EMBEDDED};
+pub(super) use images::{IMAGE_DEPTH, IMAGES, LAST_SAMPLES_ONLY, LINKS_EMBEDDED, SAMPLE_LIMITS, SAMPLE_READS, SAMPLES_KEPT};
 #[cfg(test)]
 pub(super) use paints::{
     GRADIENT_DITHER, GRADIENT_HUE, GRADIENT_PERCEPTUAL, GRADIENT_SHAPES, GRADIENTS, STOP_LINKS, SWATCH_PLACEMENT, free_gradient_name,
@@ -43,7 +50,7 @@ pub(super) use paints::{
 #[cfg(test)]
 pub(super) use symbols::{MISSING_SYMBOL, SYMBOL_ART, SYMBOL_COUNT, SYMBOL_OPTIONS};
 #[cfg(test)]
-pub(super) use texts::TYPE_ATTRIBUTES;
+pub(super) use texts::{FONT_RESOLVES, RESOLVE_EACH_RUN, TYPE_ATTRIBUTES};
 #[cfg(test)]
 pub(super) use variables::{ACTIVE, BINDINGS, LIMITS, VALUES};
 
@@ -58,7 +65,7 @@ pub(super) const PATTERN_TILES: &str = "pattern fills with more tiles than a fil
 pub(super) const CLIPPING: &str = "clipping groups and clipping layers whose clipping object isn't a path, and the clipping groups inside them, are written as their art cut to that object in the editing data for other apps";
 pub(super) const CLIP_PAINT: &str = "the fills and strokes of clipping paths that a plain fill and line can't draw are written as paths of their own inside the clipping (fills under the clipped art, strokes over it) in the editing data for other apps";
 pub(super) const CLIP_PAINT_MASKS: &str = "the opacity masks of clipping paths whose fills and strokes are written as paths of their own stay on the clipping path, not on those paths, in the editing data for other apps";
-pub(super) const LIVE: &str = "blends, meshes, repeats, placed documents and intertwines are written as their art in the editing data for other apps";
+pub(super) const LIVE: &str = "repeats, placed documents and intertwines are written as their art in the editing data for other apps";
 pub(super) const GRAPHS: &str = "graphs are written as their art, without their data or settings, in the editing data for other apps";
 pub(super) const STROKES: &str = "strokes a plain line can't draw (inside or outside the path, variable width, dots, dashes fitted to corners, gradients, patterns, arrowheads) are written as filled outlines, and brushed strokes as their brush's art, in the editing data for other apps";
 pub(super) const ITEM_TRANSPARENCY: &str =
@@ -304,15 +311,18 @@ pub(super) struct Writer<'a> {
     brush_set: brushes::Brushes,
     /// Brushes may be written; false on a large canvas, where they are left out.
     pub(super) brushes_live: bool,
+    /// Gradient meshes may be written as meshes; false on a large canvas, where they are written as
+    /// their drawn look.
+    pub(super) meshes_live: bool,
     /// The object just written is an envelope's distorted art, which the plugin's `XP` follows
     /// ([`Self::envelope`]).
     deform: bool,
     /// How many more envelopes and images with a Warp may be written live: as many as the reader
     /// checks in one file ([`crate::import::ENVELOPE_CHECKS`]), which it spends on both.
     checks_left: usize,
-    /// The image read last and its pixels ([`images::Samples::of`], `None` when they can't be
-    /// read): the pieces of a warped image, which follow one another, read them once.
-    last_samples: Option<(vectorcraft_doc::ImageBlob, Option<images::Read>)>,
+    /// The images read so far and their pixels: an image placed again, and each piece of a warped
+    /// image, is read once.
+    read_samples: images::SampleCache,
     /// The images written whole so far, by the address of their data (which each entry keeps), each
     /// with the index of its samples in [`Self::payloads`].
     whole_images: HashMap<usize, (Arc<Vec<u8>>, usize)>,
@@ -328,6 +338,14 @@ pub(super) struct Writer<'a> {
     series_tag: Option<String>,
     /// Where the `Go` lines of the graph being written start in [`Self::body`].
     graph_tags: Vec<usize>,
+    /// Blends may be written live; false on a large canvas, where they are written as their steps.
+    pub(super) blends_live: bool,
+    /// How many more objects the reader's blends may lay out ([`crate::import::BLEND_BUDGET`]).
+    blend_budget: usize,
+    /// The entries naming a blend's key object in its dictionary, and the key's id.
+    blend_role: Option<(NodeId, String)>,
+    /// The blends baking left as they are ([`blends::unbaked_blends`]); only these are written live.
+    pub(super) unbaked_blends: HashSet<NodeId>,
 }
 
 impl<'a> Writer<'a> {
@@ -395,6 +413,7 @@ impl<'a> Writer<'a> {
             wrap_moved: false,
             brush_set: brushes::Brushes::default(),
             brushes_live: true,
+            meshes_live: true,
             deform: false,
             checks_left: crate::import::ENVELOPE_CHECKS,
             objects: 0,
@@ -403,13 +422,17 @@ impl<'a> Writer<'a> {
             definition_links: 0,
             definition_symbol_nodes: 0,
             max_objects: crate::import::MAX_EDITING_OBJECTS,
-            last_samples: None,
+            read_samples: images::SampleCache::default(),
             whole_images: HashMap::new(),
             shown: vec![],
             windowed: None,
             in_graph: false,
             series_tag: None,
             graph_tags: vec![],
+            blends_live: true,
+            blend_budget: crate::import::BLEND_BUDGET,
+            blend_role: None,
+            unbaked_blends: HashSet::new(),
         }
     }
 
@@ -723,6 +746,11 @@ impl<'a> Writer<'a> {
             return self.styled_object(n, &orig, &name);
         }
         self.effects(n);
+        // A gradient mesh the reader reads as it is; else it is written as its drawn look.
+        let mut mesh = match &n.kind {
+            NodeKind::Mesh(m) => self.mesh_record(m),
+            _ => None,
+        };
         self.state(n.locked, !n.visible);
         let mut xy = Xy::of(n);
         if masked_warp_pieces(n) {
@@ -738,6 +766,11 @@ impl<'a> Writer<'a> {
         let charged = self.charges();
         match &n.kind {
             NodeKind::Layer { .. } => {}
+            NodeKind::Mesh(_) if mesh.is_some() => {
+                if let Some(record) = mesh.take() {
+                    self.write_mesh(&record, xy);
+                }
+            }
             NodeKind::Group { children, clip: true } => self.clip_group(children, xy),
             NodeKind::Group { children, clip: false } => {
                 if self.open_group("u") {
@@ -840,7 +873,10 @@ impl<'a> Writer<'a> {
             }
             NodeKind::Envelope { .. } if self.envelope(n, xy) => {}
             NodeKind::Envelope { .. } => self.drawn_art(n, xy, Some(envelopes::ENVELOPES), true),
-            NodeKind::Blend { .. } | NodeKind::Mesh(_) | NodeKind::Repeat(_) | NodeKind::PlacedDocument(_) | NodeKind::Intertwine { .. } => {
+            NodeKind::Mesh(_) => self.drawn_art(n, xy, Some(meshes::MESHES), true),
+            NodeKind::Blend { .. } if self.blend(n, xy) => {}
+            NodeKind::Blend { .. } => self.drawn_art(n, xy, Some(blends::BLENDS), true),
+            NodeKind::Repeat(_) | NodeKind::PlacedDocument(_) | NodeKind::Intertwine { .. } => {
                 self.drawn_art(n, xy, Some(LIVE), true);
             }
             // Ruler guides are kept in the document's native copy only.
@@ -919,7 +955,8 @@ impl<'a> Writer<'a> {
             self.warn(w);
         }
         let moved = bounds && self.wrap_on_bounds(n, state);
-        if self.nest < MAX_NEST {
+        // A gradient mesh's drawn look is paths, which hold nothing: it is written at any depth.
+        if self.nest < MAX_NEST || matches!(n.kind, NodeKind::Mesh(_)) {
             let g = vectorcraft_effects::expand_live_deep(Some(self.doc), n);
             self.nest += 1;
             self.drawn += 1;
@@ -955,9 +992,10 @@ impl<'a> Writer<'a> {
     /// `n`'s `/ArtDictionary`, after it, when it has a name (`AI10_ArtUID`, see [`Self::take_id`]),
     /// is bound to variables ([`Self::bound_variables`]; without a name, it gets an XML id and an
     /// empty `AIArtName`), has text wrap options ([`Self::text_wrap`]), has an opacity mask
-    /// (`AI9_Mask`, see [`Self::mask`]), or is a symbol's art (its symbol's entries first, see
-    /// [`Self::define_symbol`]). False when `n` has an opacity mask that is left out: nested too
-    /// deep, or its art doesn't fit.
+    /// (`AI9_Mask`, see [`Self::mask`]), is a symbol's art (its symbol's entries first, see
+    /// [`Self::define_symbol`]), or is a blend's key object (its part and id after the name, see
+    /// [`blends`]). False when `n` has an opacity mask that is left out: nested too deep, or its art
+    /// doesn't fit.
     fn dictionary(&mut self, n: &Node) -> bool {
         let name = n.name.as_deref().filter(|s| !s.is_empty());
         let moved = std::mem::take(&mut self.wrap_moved);
@@ -977,7 +1015,11 @@ impl<'a> Writer<'a> {
             Some((id, _)) if *id == n.id => self.root_entries.take().map(|(_, e)| e),
             _ => None,
         };
-        if name.is_none() && mask.is_none() && bound.is_empty() && entries.is_none() && wrap.is_none() {
+        let role = match &self.blend_role {
+            Some((id, _)) if *id == n.id => self.blend_role.take().map(|(_, e)| e),
+            _ => None,
+        };
+        if name.is_none() && mask.is_none() && bound.is_empty() && entries.is_none() && wrap.is_none() && role.is_none() {
             return mask_written;
         }
         let start = self.body.len();
@@ -998,6 +1040,10 @@ impl<'a> Writer<'a> {
                 self.bound.push((n.id, id, bound));
             }
         }
+        let has_role = role.is_some();
+        if let Some(r) = role {
+            self.body.push_str(&r);
+        }
         if let Some(w) = wrap {
             self.text_wrap(w);
         }
@@ -1005,7 +1051,7 @@ impl<'a> Writer<'a> {
         if let Some(m) = mask
             && !self.mask(m)
         {
-            if !has_id && !has_entries && wrap.is_none() {
+            if !has_id && !has_entries && wrap.is_none() && !has_role {
                 self.body.truncate(start);
                 return false;
             }
@@ -1558,7 +1604,7 @@ impl<'a> Writer<'a> {
             let placed = self.texts.thread(doc, thread, n.id, self.canvas, &|id| !cut_to_clipping_object(doc, id), &self.wraps_held);
             placed.map(|p| (p, self.texts.take_lost()))
         } else {
-            self.texts.add(t, self.canvas).map(|story| ((story, 0), texts::loses(t)))
+            self.texts.add(t, self.canvas).map(|story| ((story, 0), self.texts.loses(t)))
         };
         let Some(((story, frame), lost)) = placed else {
             // The text document can't hold it: the outlines count their own objects.
@@ -1701,8 +1747,8 @@ impl<'a> Writer<'a> {
         self.plain_color(*color, stroke);
     }
 
-    /// A color that names no swatch: `g` (gray), `k` (CMYK), else `c m y k r g b Xa` (RGB in the
-    /// working RGB space, and Lab as display RGB), with its CMYK equivalent (an RGB color's from its
+    /// A color that names no swatch: `g` (gray), `k` (CMYK), else `c m y k r g b Xa` (RGB, and Lab
+    /// as RGB, in the working RGB space), with its CMYK equivalent (an RGB color's from its
     /// values as written, a Lab color's from its Lab values).
     fn plain_color(&mut self, color: Color, stroke: bool) {
         let s = &mut self.body;
