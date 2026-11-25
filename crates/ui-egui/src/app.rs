@@ -3,13 +3,16 @@ use craft::host::{AppInfo, Host, Wake};
 use craft::platform::clipboard::{Clipboard, ClipboardProbe, EventClipboard};
 use craft::platform::clock::monotonic_ms;
 use craft::theme::variant::Tone;
-use craft::ui::contract::Bind;
+use craft::ui::buttons::{ActiveLook, PushButtonLook};
+use craft::ui::contract::{Bind, GlyphColon};
+use craft::ui::menu::MenuTitlePad;
 use craft::ui::runtime::env::{RootEnv, Scale, ScrubDrags, WindowKey};
 use craft::ui::runtime::frame::{FrameInput, FrameOutput};
 use craft::ui::runtime::toast::{self, Toast};
 use craft::ui::runtime::windows::WindowHost;
 use craft::ui::shell::embed::CloseDecision;
 use craft::ui::shell::{AppShell, CanvasPanel, Slot};
+use craft::ui::text::{NumberLook, NumberPrecision};
 use vectorcraft_engine::cmd::clipboard::PASTE_ORDER;
 use vectorcraft_engine::cmd::toast::Level;
 
@@ -305,6 +308,15 @@ impl VectorcraftApp {
 /// eframe isn't a dependency of this crate (the host owns the event loop); these entry points are
 /// called from the host's `eframe::App` impl through `embed`'s hooks.
 impl VectorcraftApp {
+    /// Seconds on the app's clock: the monotonic clock, or the time a test set in `now_override`.
+    pub(crate) fn now(&self) -> f64 {
+        #[cfg(test)]
+        if let Some(now) = self.now_override {
+            return now;
+        }
+        now_secs()
+    }
+
     /// Applies the work that finished off the UI thread. It stays pending while a script runs, since
     /// every change to the documents ends in a busy error until the script ends.
     pub(crate) fn poll_finished_work(&mut self) {
@@ -412,10 +424,7 @@ impl VectorcraftApp {
         // Monotonic host time, never egui's `InputState::time`: a hidden window's `logic` replays
         // the last shown pass's time, freezing recovery, clipboard polling and deadlines. Tests
         // inject a clock to drive idle scheduling deterministically.
-        #[cfg(test)]
-        let now = self.now_override.unwrap_or_else(now_secs);
-        #[cfg(not(test))]
-        let now = now_secs();
+        let now = self.now();
         self.perf.fps = self.frame_rate.frame(now, self.perf.frame_ms / 1000.0);
         self.sync_views();
         self.refresh_replace_font_warning(false);
@@ -662,6 +671,20 @@ pub(crate) fn root_env(prefs: &vectorcraft_engine::Prefs, native_ppp: f32) -> Ro
     root.sizes = theme::app_sizes();
     root.values.set(view::zoom_scheme(prefs, native_ppp));
     root.values.set(if prefs.scrub_numeric_fields { ScrubDrags::LabelOnly } else { ScrubDrags::Off });
+    // Number fields as production drew them: the value and its unit one run at the start ("720 pt"), percentages
+    // whole and lengths to a thousandth of a point (357.114 pt).
+    root.values.set(NumberPrecision::Measured);
+    root.values.set(NumberLook::Inline);
+    // Push buttons that ask for no look are filled tiles with no edge at rest, as production's were.
+    root.values.set(PushButtonLook::Filled);
+    // Every icon button that is on (the current tool, Snap, Guides, a panel toggle) shows production's highlight: the
+    // pressed fill (`tool_active`) with no accent edge.
+    root.values.set(ActiveLook::Pressed);
+    // A glyph that stands for a word caption ("X", "W") takes a form's colon as production drew it ("X:"); "#" and
+    // the colour channel letters stay bare.
+    root.values.set(GlyphColon::Form);
+    // The menu bar's titles stand as close as production's, which share the line with the bar's other controls.
+    root.values.set(MenuTitlePad::Control);
     // A bare Tab on the canvas, or with nothing focused, toggles the panels (`window.dock`) instead of moving focus.
     root.tab_toggles_chrome = true;
     // Escape in a text field gives up its focus, reverting any typing, so the next keys are the window's.
